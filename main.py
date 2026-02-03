@@ -11,6 +11,48 @@ import json
 
 app = typer.Typer(help="Advanced Hybrid Static + AI Code Analysis System")
 console = Console()
+@app.command()
+def check_files(
+    folder: Path = typer.Argument(..., help="Folder to check file-by-file")
+):
+    """
+    Check each file one-by-one for syntax correctness.
+    """
+    from core.scanner import FileScanner
+    from analyzers.static_syntax import StaticSyntaxAnalyzer
+
+    console.print("[bold cyan]🔍 File-by-file syntax check[/bold cyan]\n")
+
+    scanner = FileScanner(folder)
+    files = scanner.scan()
+
+    analyzer = StaticSyntaxAnalyzer()
+
+    passed = 0
+    failed = 0
+
+    for idx, file_path in enumerate(files, 1):
+        console.print(f"[yellow]{idx}/{len(files)} Checking:[/yellow] {file_path}")
+
+        is_valid, errors = analyzer.analyze_file(file_path)
+
+        if is_valid:
+            console.print(f"  [green]✅ OK[/green]\n")
+            passed += 1
+        else:
+            console.print(f"  [red]❌ FAILED[/red]")
+            for e in errors:
+                console.print(
+                    f"    Line {e.line}, Col {e.column}: {e.message} "
+                    f"[{e.parser}]"
+                )
+            console.print()
+            failed += 1
+
+    console.print(
+        f"[bold green]✔ Passed:[/bold green] {passed}  "
+        f"[bold red]✖ Failed:[/bold red] {failed}"
+    )
 
 @app.command()
 def analyze(

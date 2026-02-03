@@ -12,8 +12,8 @@ import shutil
 class SyntaxFixGenerator:
     """Generate fixes for syntax errors using vLLM with smart context extraction."""
     
-    CONTEXT_LINES_BEFORE = 5  # Lines before error
-    CONTEXT_LINES_AFTER = 5   # Lines after error
+    CONTEXT_LINES_BEFORE = 10 # Lines before error
+    CONTEXT_LINES_AFTER = 10   # Lines after error
     MAX_LINES_FOR_WHOLE_FILE = 100  # Threshold for whole-file vs regional
     
     def __init__(self, llm_client):
@@ -102,7 +102,7 @@ Do NOT change logic or add features - ONLY fix syntax.
         regions = self._extract_error_regions(code, errors)
         
         # Build prompt
-        prompt = self._build_regional_prompt(file_path, regions, errors)
+        prompt = self._build_regional_prompt(file_path, regions, errors, code)
         
         try:
             # Get fixes from LLM
@@ -151,10 +151,13 @@ Do NOT change logic or add features - ONLY fix syntax.
         
         return regions
     
-    def _build_regional_prompt(self, file_path: Path, regions: List[Dict], errors: List) -> str:
-        """Build prompt with error regions."""
+    def _build_regional_prompt(self, file_path: Path, regions: List[Dict], errors: List, original_code: str) -> str:
+        """Build prompt with error regions and global context."""
         
         language = self._get_language(file_path)
+        
+        # Extract global context (imports, constants)
+        global_context = self._extract_global_context(original_code)
         
         # Build regions section
         regions_text = []
@@ -175,6 +178,11 @@ Do NOT change logic or add features - ONLY fix syntax.
         return f"""You are an expert {language} developer. Fix the syntax errors in each region below.
 
 **File:** {file_path.name}
+
+**Global Context (Imports & Constants):**
+```{language}
+{global_context}
+```
 
 {regions_str}
 
@@ -271,3 +279,28 @@ Return JSON with fixes for each region.
             if start != -1 and end > start:
                 return response[start:end]
             return response.strip()
+
+    def _extract_global_context(self, code: str) -> str:
+        """
+        Scans values for imports and global constants.
+        This provides the LLM with necessary context even when fixing a small region.
+        """
+        lines = code.split('\n')
+        context_lines = []
+        
+        for line in lines:
+            stripped = line.strip()
+            # 1. Capture all Import statements
+            if stripped.startswith('import ') or stripped.startswith('from '):
+                context_lines.append(line)
+            
+            # 2. Capture Global Constants (e.g., MAX_RETRIES = 5)
+            # We look for lines that look like: VARIABLE_NAME = ...
+            elif '=' in line:
+                parts = line.split('=')
+                left_side = parts[0].strip()
+                # Heuristic: Uppercase usually implies a constant
+                if left_side.isupper() and ' ' not in left_side:
+                    context_lines.append(line)
+        
+        return '\n'.join(context_lines)
