@@ -4,7 +4,7 @@ This file will be auto-fixed by the LLM
 """
 
 # Error 1: Missing closing parenthesis
-def calculate_total(items
+def calculate_total(items):
     total = 0
     for item in items:
         total += item.price
@@ -25,7 +25,7 @@ def process_order(order):
 def format_data(data):
     result = {
         "id": data.id,
-        "name": data.name
+        "name": data.name }
     return result
 
 # Error 5: Invalid syntax in expression

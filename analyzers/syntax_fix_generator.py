@@ -1,11 +1,13 @@
 """
 Syntax Error Fix Generator
 Uses vLLM to automatically fix syntax errors with regional context.
+Supports applying fixes directly to files.
 """
 
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Optional
 import json
+import shutil
 
 class SyntaxFixGenerator:
     """Generate fixes for syntax errors using vLLM with smart context extraction."""
@@ -221,12 +223,10 @@ Return JSON with fixes for each region.
         """Determine language from file extension."""
         ext_map = {
             '.py': 'python',
-            '.js': 'javascript',
-            '.ts': 'typescript',
             '.java': 'java',
             '.cpp': 'cpp',
             '.c': 'c',
-            '.go': 'go'
+            '.h': 'cpp'  # Header files treated as C++ for syntax
         }
         return ext_map.get(file_path.suffix, 'python')
     

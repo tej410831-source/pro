@@ -5,11 +5,19 @@
 ## Features
 
 ✅ **Static-First Syntax Analysis** - 100% accurate syntax checking  
-✅ **Cross-File Redundancy Detection** - Find duplicate functions across files  
-✅ **Dead Code Detection** - Identify never-called functions  
-✅ **Circular Dependency Detection** - Detect import cycles  
-✅ **Auto-Fix Generation** - LLM-powered code patches  
-✅ **HTML Dashboard** - Beautiful interactive reports  
+✅ **Cross-File Redundancy Detection** - Find duplicate functions  
+✅ **Dead Code Detection** - Functions never called  
+✅ **Circular Dependency Detection** - Import cycles  
+✅ **LLM Semantic Analysis** - Logic errors, security issues  
+✅ **Automatic Fix Generation** - Executable code patches  
+
+## Supported Languages
+
+- Python (.py) - via built-in `ast` module
+- Java (.java) - via tree-sitter
+- C++ (.cpp) - via tree-sitter
+- C (.c) - via tree-sitter
+- C/C++ Headers (.h) - via tree-sitter
 
 ## Installation
 

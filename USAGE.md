@@ -61,11 +61,11 @@ python main.py analyze /path/to/your/project --vllm-url http://localhost:11434/v
 
 ### **Phase 1: File Scanning**
 - Recursively finds all code files
-- Filters by extension (`.py`, `.js`, `.ts`, `.java`, etc.)
+- Filters by extension (`.py`, `.java`, `.cpp`)
 - Skips ignored directories (`.git`, `node_modules`, etc.)
 
 ### **Phase 2: Static Syntax Analysis** ✨ **NEW: Auto-Fix**
-- Uses native parsers (Python `ast`, tree-sitter)
+- Uses native parsers (Python: `ast`, Java/C++: tree-sitter)
 - Detects syntax errors with 100% accuracy
 - **Automatically generates fixes using vLLM**
 - **Validates fixes before proceeding**

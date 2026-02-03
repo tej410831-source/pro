@@ -11,42 +11,95 @@ from typing import List, Optional
 class SyntaxError:
     def __init__(self, line: int, column: int, message: str, parser: str):
         self.line = line
-        self.column = column
-        self.message = message
-        self.parser = parser
-        self.severity = "critical"
-        self.type = "syntax_error"
+    type: str = "syntax_error"
+    severity: str = "critical"
+    line: int = 0
+    column: int = 0
+    message: str = ""
+    parser: str = "unknown"
 
 class StaticSyntaxAnalyzer:
-    """
-    Uses language-native parsers for 100% accurate syntax checking.
-    Currently supports Python with ast module.
-    """
+    """Analyze source files for syntax errors using native parsers."""
     
     def __init__(self):
-        pass
+        self.tree_sitter_available = False
+        self.parsers = {}
+        self._init_tree_sitter()
     
-    def analyze_file(self, file_path: Path) -> tuple[bool, List[SyntaxError]]:
+    def _init_tree_sitter(self):
+        """Initialize tree-sitter parsers for Java and C++."""
+        try:
+            from tree_sitter import Language, Parser
+            from tree_sitter_languages import get_language, get_parser
+            
+            # Initialize parsers for Java, C++, C, and header files
+            self.parsers = {
+                '.java': get_parser('java'),
+                '.cpp': get_parser('cpp'),
+                '.c': get_parser('c'),
+                '.h': get_parser('cpp')  # Header files use C++ parser
+            }
+            self.tree_sitter_available = True
+            
+        except ImportError:
+            # tree-sitter not installed, will fall back to Python only
+            self.tree_sitter_available = False
+    
+    def analyze_file(self, file_path: Path) -> Tuple[bool, List[SyntaxError]]:
         """
-        Returns: (is_valid, errors)
-        If is_valid is False, DO NOT proceed to LLM analysis.
+        Analyze a file for syntax errors.
+        
+        Args:
+            file_path: Path to the file
+            
+        Returns:
+            Tuple of (is_valid, errors_list)
         """
         ext = file_path.suffix
         
         if ext == '.py':
             return self._check_python(file_path)
+        elif ext in self.parsers and self.tree_sitter_available:
+            return self._check_tree_sitter(file_path, ext)
         else:
-            # For non-Python files, skip syntax check for now
-            # User can add tree-sitter later or use Python 3.12
+            # Unsupported language, treat as valid
             return True, []
     
-    def _check_python(self, file_path: Path) -> tuple[bool, List[SyntaxError]]:
-        """Use Python's ast module for absolute accuracy."""
+    def analyze_code(self, code: str, extension: str) -> Tuple[bool, List[SyntaxError]]:
+        """
+        Analyze code string directly (for validating fixes).
+        
+        Args:
+            code: Source code as string
+            extension: File extension (.py, .js, etc.)
+            
+        Returns:
+            Tuple of (is_valid, errors_list)
+        """
+        if extension == '.py':
+            return self._check_python_code(code)
+        elif extension in self.parsers and self.tree_sitter_available:
+            return self._check_tree_sitter_code(code, extension)
+        else:
+            return True, []
+    
+    def _check_python(self, file_path: Path) -> Tuple[bool, List[SyntaxError]]:
+        """Check Python file using ast module."""
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 source = f.read()
-            
-            ast.parse(source, filename=str(file_path))
+            return self._check_python_code(source)
+        except Exception as e:
+            error = SyntaxError(
+                message=f"Failed to read file: {str(e)}",
+                parser="python-ast"
+            )
+            return False, [error]
+    
+    def _check_python_code(self, source: str) -> Tuple[bool, List[SyntaxError]]:
+        """Check Python code string."""
+        try:
+            ast.parse(source)
             return True, []
             
         except SyntaxError as e:
@@ -57,12 +110,73 @@ class StaticSyntaxAnalyzer:
                 parser="python-ast"
             )
             return False, [error]
+        
         except Exception as e:
             error = SyntaxError(
-                line=0,
-                column=0,
-                message=f"Parse error: {str(e)}",
+                message=str(e),
                 parser="python-ast"
             )
             return False, [error]
-
+    
+    def _check_tree_sitter(self, file_path: Path, extension: str) -> Tuple[bool, List[SyntaxError]]:
+        """Check file using tree-sitter."""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                source = f.read()
+            return self._check_tree_sitter_code(source, extension)
+        except Exception as e:
+            error = SyntaxError(
+                message=f"Failed to read file: {str(e)}",
+                parser="tree-sitter"
+            )
+            return False, [error]
+    
+    def _check_tree_sitter_code(self, source: str, extension: str) -> Tuple[bool, List[SyntaxError]]:
+        """Check code using tree-sitter parser."""
+        try:
+            parser = self.parsers.get(extension)
+            if not parser:
+                return True, []
+            
+            # Parse the code
+            tree = parser.parse(bytes(source, "utf8"))
+            
+            # Check for syntax errors
+            errors = []
+            if tree.root_node.has_error:
+                # Find error nodes
+                errors = self._find_tree_sitter_errors(tree.root_node, source)
+            
+            return len(errors) == 0, errors
+            
+        except Exception as e:
+            error = SyntaxError(
+                message=str(e),
+                parser=f"tree-sitter-{extension}"
+            )
+            return False, [error]
+    
+    def _find_tree_sitter_errors(self, node, source: str) -> List[SyntaxError]:
+        """Recursively find error nodes in tree-sitter parse tree."""
+        errors = []
+        
+        if node.type == "ERROR":
+            line = node.start_point[0] + 1  # 1-indexed
+            column = node.start_point[1]
+            
+            # Get error context
+            lines = source.split('\n')
+            error_line = lines[line - 1] if line <= len(lines) else ""
+            
+            errors.append(SyntaxError(
+                line=line,
+                column=column,
+                message=f"Syntax error near: {error_line[:50]}",
+                parser="tree-sitter"
+            ))
+        
+        # Recurse through children
+        for child in node.children:
+            errors.extend(self._find_tree_sitter_errors(child, source))
+        
+        return errors

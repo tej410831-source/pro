@@ -62,6 +62,7 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
     valid_files = []
     syntax_errors = {}
     syntax_fixes = {}
+    applied_fixes = {}
     
     for file_path in files:
         is_valid, errors = syntax_analyzer.analyze_file(file_path)
@@ -96,32 +97,48 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
                     )
                     
                     if fix_result['success']:
-                        # Validate the fix
                         fixed_code = fix_result['fixed_code']
-                        is_fixed_valid, remaining_errors = syntax_analyzer.analyze_file(file_path)
                         
-                        # Manual validation since we have the fixed code
-                        try:
-                            import ast
-                            ast.parse(fixed_code)
-                            is_fixed_valid = True
-                            remaining_errors = []
-                        except:
-                            is_fixed_valid = False
+                        # Validate the fix using static analyzer
+                        is_fixed_valid, remaining_errors = syntax_analyzer.analyze_code(
+                            fixed_code, 
+                            file_path.suffix
+                        )
                         
                         if is_fixed_valid:
-                            syntax_fixes[str(file_path)] = {
-                                "original_code": original_code,
-                                "fixed_code": fixed_code,
-                                "errors_fixed": len(errors),
-                                "method": fix_result.get('method', 'unknown')
-                            }
+                            # Fix is valid! Apply to file
+                            apply_result = syntax_fix_generator.apply_fix_to_file(
+                                file_path,
+                                fixed_code,
+                                create_backup=True
+                            )
                             
-                            # Now treat as valid for further analysis
-                            valid_files.append(file_path)
-                            console.print(f"  ✅ Fixed successfully using {fix_result.get('method', 'LLM')}")
+                            if apply_result['success']:
+                                # Re-validate the actual file
+                                final_valid, final_errors = syntax_analyzer.analyze_file(file_path)
+                                
+                                if final_valid:
+                                    syntax_fixes[str(file_path)] = {
+                                        "original_code": original_code,
+                                        "fixed_code": fixed_code,
+                                        "errors_fixed": len(errors),
+                                        "method": fix_result.get('method', 'unknown'),
+                                        "backup_path": apply_result.get('backup_path')
+                                    }
+                                    
+                                    applied_fixes[str(file_path)] = True
+                                    
+                                    # Now treat as valid for further analysis
+                                    valid_files.append(file_path)
+                                    console.print(f"  ✅ Fixed & applied successfully ({fix_result.get('method', 'LLM')})")
+                                else:
+                                    # Restore from backup
+                                    syntax_fix_generator.restore_from_backup(file_path)
+                                    console.print(f"  ⚠️  Fixed code still has errors after apply, restored backup")
+                            else:
+                                console.print(f"  ✗ Failed to apply fix: {apply_result.get('error', 'Unknown')}")
                         else:
-                            console.print(f"  ⚠️  Generated fix still has errors")
+                            console.print(f"  ⚠️  Generated fix still has {len(remaining_errors)} error(s)")
                     else:
                         console.print(f"  ✗ Fix generation failed: {fix_result.get('error', 'Unknown')}")
                 
@@ -133,8 +150,9 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
     console.print(f"\n✓ {len(valid_files)} files ready for analysis")
     if syntax_errors:
         console.print(f"✗ {len(syntax_errors)} files had syntax errors")
-        if syntax_fixes:
-            console.print(f"✅ {len(syntax_fixes)} files fixed automatically\n")
+        if applied_fixes:
+            console.print(f"✅ {len(applied_fixes)} files FIXED & APPLIED to codebase")
+            console.print(f"   💾 Backups saved as .bak files\n")
         else:
             console.print("")
     
@@ -231,6 +249,7 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
             "files_analyzed": len(files),
             "files_with_syntax_errors": len(syntax_errors),
             "syntax_errors_fixed": len(syntax_fixes),
+            "fixes_applied_to_codebase": len(applied_fixes),
             "valid_files": len(valid_files)
         },
         "summary": {

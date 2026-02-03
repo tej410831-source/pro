@@ -10,7 +10,12 @@ from typing import List
 class FileScanner:
     def __init__(self, root_path: Path):
         self.root_path = root_path
-        self.extensions = {'.py', '.js', '.ts', '.java', '.cpp', '.c', '.go', '.rs'}
+        self.extensions = {'.py', '.java', '.cpp', '.c', '.h'}  # Python, Java, C/C++
+        self.ignore_dirs = {
+            '.git', 'node_modules', '__pycache__', 'venv', '.venv',
+            'build', 'dist', '.tox', '.mypy_cache', '.pytest_cache',
+            'target', 'bin', 'obj'
+        }
     
     def scan(self) -> List[Path]:
         """Scan for code files."""
@@ -18,10 +23,7 @@ class FileScanner:
         
         for root, dirs, files in os.walk(self.root_path):
             # Skip common ignored directories
-            dirs[:] = [d for d in dirs if d not in {
-                '.git', 'node_modules', '__pycache__', 'venv', '.venv',
-                'build', 'dist', '.tox', '.egg-info'
-            }]
+            dirs[:] = [d for d in dirs if d not in self.ignore_dirs]
             
             for file in files:
                 file_path = Path(root) / file
