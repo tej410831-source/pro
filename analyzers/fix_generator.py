@@ -3,9 +3,11 @@ Fix Code Generator
 Generates executable code patches for bugs using LLM.
 """
 
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from pathlib import Path
+import json
 import difflib
+from utils.llm_utils import extract_json, robust_json_load
 
 class CodeFix:
     def __init__(self, fix_type: str, fixed_code: str, explanation: str, line: int):
@@ -29,61 +31,78 @@ class FixGenerator:
         file_path: Path,
         line: int,
         code_snippet: str,
-        language: str
+        language: str,
+        description: str,
+        suggestion: str,
+        global_context: str = ""
     ) -> Optional[CodeFix]:
         """
         Generate a fix for a detected bug.
         """
         
         prompt = self._build_fix_prompt(
-            bug_type, severity, str(file_path), line, code_snippet, language
+            bug_type, severity, str(file_path), line, code_snippet, language, description, suggestion, global_context
         )
         
         try:
             response = await self.llm_client.generate_completion(prompt)
             
             # Parse response (expected JSON)
-            import json
-            fix_data = json.loads(response)
+            fix_data = robust_json_load(response)
             
+            if not fix_data:
+                print(f"\n  [red]✗ FAILED TO PARSE AI RESPONSE FOR {file_path.name}[/red]")
+                print(f"  [dim]Check the vLLM logs or try again with a different model.[/dim]\n")
+                return None
+            
+            if "fixed_code" not in fix_data:
+                print(f"  [red]✗ Missing 'fixed_code' in LLM response for {file_path.name}[/red]")
+                return None
+
             return CodeFix(
                 fix_type=fix_data.get("fix_type", "inline_replacement"),
                 fixed_code=fix_data["fixed_code"],
-                explanation=fix_data["explanation"],
+                explanation=fix_data.get("explanation", "Applied semantic fix."),
                 line=line
             )
         except Exception as e:
-            # Fix generation failed, return None
+            print(f"  [red]✗ Fix Generation Exception: {e}[/red]")
             return None
     
+    # _extract_json replaced by utils.llm_utils.extract_json
+
     def _build_fix_prompt(
         self, bug_type: str, severity: str, file: str, 
-        line: int, code: str, language: str
+        line: int, code: str, language: str,
+        description: str, suggestion: str, global_context: str
     ) -> str:
-        return f"""You are an expert software engineer specializing in bug fixes.
+        context_section = ""
+        if global_context:
+            context_section = f"\n**Global Context (Imports & Constants):**\n```{language}\n{global_context}\n```\n"
 
-Bug detected:
+        return f"""You are an expert senior {language} engineer.
+{context_section}
+**Target Bug:**
 - Type: {bug_type}
-- Severity: {severity}
-- File: {file}
 - Line: {line}
+- Issue: {description}
+- Recommendation: {suggestion}
 
-Original Code:
+**Source Code:**
 ```{language}
 {code}
 ```
 
-Task:
-1. Fix the bug
-2. Keep behavior unchanged except for the fix
-3. Follow {language} best practices
-4. Output ONLY valid, executable code
+**Task:**
+1. Fix the bug in the provided source code.
+2. IMPORTANT: Return the **full and complete** source code in the `fixed_code` field.
+3. Keep all other logic intact.
+4. Ensure the JSON is valid. If your `fixed_code` contains double quotes, escape them as `\"`.
 
-Respond in JSON format:
+Respond with ONLY valid JSON:
 {{
-  "fix_type": "inline_replacement",
-  "fixed_code": "<complete fixed code>",
-  "explanation": "<what was changed and why>"
+  "fixed_code": "<full source code with fix applied>",
+  "explanation": "<brief summary of change>"
 }}"""
     
     def generate_unified_diff(

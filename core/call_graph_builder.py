@@ -6,14 +6,14 @@ Constructs function call graph and file dependency graph using NetworkX.
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 import networkx as nx
-from core.symbol_table import Symbol, SymbolTable
+from core.symbol_table import Symbol, SymbolTableBuilder
 
 class CallGraphBuilder:
     """
     Builds directed graph of function calls across the codebase.
     """
     
-    def __init__(self, symbol_table: SymbolTable):
+    def __init__(self, symbol_table: SymbolTableBuilder):
         self.symbol_table = symbol_table
         self.function_graph = nx.DiGraph()  # Function -> Function calls
         self.file_graph = nx.DiGraph()       # File -> File dependencies
@@ -21,16 +21,13 @@ class CallGraphBuilder:
     
     def build_call_graph(self, parsed_files: Dict[Path, dict]):
         """
-        Build call graph from parsed file data.
-        
-        Args:
-            parsed_files: {file_path: {"functions": [...], "calls": [...]}}
+        Build call graph and file dependency graph from parsed file data.
         """
         # Phase 1: Add all function nodes
         for qualified_name, symbol in self.symbol_table.symbols.items():
             self.function_graph.add_node(qualified_name, symbol=symbol)
         
-        # Phase 2: Add call edges
+        # Phase 2: Add call edges (Function -> Function)
         for file_path, data in parsed_files.items():
             for func_data in data.get("functions", []):
                 caller = func_data.get("qualified_name")
@@ -38,14 +35,33 @@ class CallGraphBuilder:
                 
                 if caller:
                     self.call_sites[caller] = calls
-                    
-                    # Try to resolve calls to qualified names
                     for call_name in calls:
                         callee = self._resolve_call(call_name, file_path)
                         if callee and callee in self.symbol_table.symbols:
                             self.function_graph.add_edge(caller, callee)
+            
+            # Phase 3: Add import edges (File -> File) directly from parser data
+            caller_file = str(file_path)
+            if not self.file_graph.has_node(caller_file):
+                self.file_graph.add_node(caller_file)
+                
+            for imp in data.get("imports", []):
+                # Handle 'from module import names'
+                if imp.get("module"):
+                    module_name = imp["module"]
+                    # Find file corresponding to this module
+                    # (Simple heuristic: module name matches filename)
+                    for other_path in parsed_files.keys():
+                        if other_path.stem == module_name:
+                            self.file_graph.add_edge(caller_file, str(other_path))
+                
+                # Handle 'import name'
+                for name in imp.get("names", []):
+                    for other_path in parsed_files.keys():
+                        if other_path.stem == name:
+                            self.file_graph.add_edge(caller_file, str(other_path))
         
-        # Phase 3: Build file dependency graph
+        # Phase 4: Build file dependency graph from function calls as well
         self._build_file_graph()
     
     def _resolve_call(self, call_name: str, current_file: Path) -> str:

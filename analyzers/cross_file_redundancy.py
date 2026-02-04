@@ -57,8 +57,8 @@ class CrossFileRedundancyDetector:
         Calculate token-based similarity using SequenceMatcher.
         """
         # Get code for both functions
-        code1 = func1.signature  # Use signature as proxy for now
-        code2 = func2.signature
+        code1 = func1.body_code or func1.signature
+        code2 = func2.body_code or func2.signature
         
         # Tokenize (simple: split by whitespace)
         tokens1 = set(code1.split())

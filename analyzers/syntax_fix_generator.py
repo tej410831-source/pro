@@ -1,13 +1,8 @@
-"""
-Syntax Error Fix Generator
-Uses vLLM to automatically fix syntax errors with regional context.
-Supports applying fixes directly to files.
-"""
-
 from pathlib import Path
 from typing import List, Dict, Optional
 import json
 import shutil
+from utils.llm_utils import extract_json, robust_json_load
 
 class SyntaxFixGenerator:
     """Generate fixes for syntax errors using vLLM with smart context extraction."""
@@ -47,6 +42,27 @@ class SyntaxFixGenerator:
             # Large file: regional fixing
             return await self._fix_regions(file_path, code, errors)
     
+    def apply_fixes(self, original_code: str, regions: List[Dict], selected_fixes: List[Dict]) -> str:
+        """Apply a subset of fixes to the original code."""
+        lines = original_code.split('\n')
+        
+        # Apply fixes in reverse order to maintain line numbers
+        # selected_fixes should be a list of fix objects from the LLM
+        fixes = sorted(selected_fixes, key=lambda x: x['region'], reverse=True)
+        
+        for fix in fixes:
+            region_idx = fix['region'] - 1
+            if region_idx < len(regions):
+                region = regions[region_idx]
+                fixed_lines = fix['fixed_code'].split('\n')
+                
+                # Replace lines in original
+                start = region['start_line'] - 1
+                end = region['end_line']
+                lines[start:end] = fixed_lines
+        
+        return '\n'.join(lines)
+    
     async def _fix_whole_file(self, file_path: Path, code: str, errors: List) -> Dict:
         """Fix small files by sending entire content."""
         
@@ -70,22 +86,42 @@ class SyntaxFixGenerator:
 {code}
 ```
 
-**Task:** Fix ALL syntax errors. Return ONLY the corrected code.
-Do NOT change logic or add features - ONLY fix syntax.
+**Task:** Fix ALL syntax errors. Return the corrected code and a brief explanation of what was changed.
 
-**Output:**
-```{language}
-<your_fixed_code_here>
-```
+**Response Format (JSON):**
+Return a JSON object with EXACTLY two keys: "fixed_code" and "explanation". 
+IMPORTANT: Use double backslashes for newlines in fixed_code strings, or ensure the response is valid JSON that can be parsed by `json.loads`.
+
+{{
+  "fixed_code": "def example():\\n    print('fixed')",
+  "explanation": "Brief description"
+}}
 """
         
         try:
             response = await self.llm_client.generate_completion(prompt, temperature=0.1)
-            fixed_code = self._extract_code(response, language)
+            fix_data = json.loads(extract_json(response))
             
+            # For whole file, we treat it as a single region covering everything
+            fix_obj = {
+                'region': 1,
+                'fixed_code': fix_data.get('fixed_code', ''),
+                'explanation': fix_data.get('explanation', 'Fixed syntax errors.')
+            }
+            
+            # Create a "pseudo-region" for the whole file
+            region_obj = {
+                'error': errors[0], # Just use first error for ref
+                'code': code,
+                'start_line': 1,
+                'end_line': len(code.split('\n')),
+                'error_line_in_region': errors[0].line
+            }
+
             return {
                 'success': True,
-                'fixed_code': fixed_code,
+                'fixes': [fix_obj],
+                'regions': [region_obj],
                 'method': 'whole_file'
             }
         except Exception as e:
@@ -107,15 +143,16 @@ Do NOT change logic or add features - ONLY fix syntax.
         try:
             # Get fixes from LLM
             response = await self.llm_client.generate_completion(prompt, temperature=0.1)
-            
-            # Apply fixes to original code
-            fixed_code = self._apply_regional_fixes(code, regions, response)
-            
+            response_data = robust_json_load(response)
+            if not response_data:
+                raise ValueError("Could not parse LLM response")
+            fixes = response_data.get('fixes', [])
+
             return {
                 'success': True,
-                'fixed_code': fixed_code,
-                'method': 'regional',
-                'regions_fixed': len(regions)
+                'fixes': fixes,
+                'regions': regions,
+                'method': 'regional'
             }
         except Exception as e:
             return {
@@ -192,40 +229,41 @@ Return JSON with fixes for each region.
 **Response Format:**
 {{
   "fixes": [
-    {{"region": 1, "fixed_code": "..."}},
-    {{"region": 2, "fixed_code": "..."}}
+    {{
+      "region": 1, 
+      "fixed_code": "...",
+      "explanation": "<brief explanation of fix for this region>"
+    }},
+    {{
+      "region": 2, 
+      "fixed_code": "...",
+      "explanation": "..."
+    }}
   ]
 }}
 """
     
-    def _apply_regional_fixes(self, original_code: str, regions: List[Dict], llm_response: str) -> str:
-        """Apply regional fixes to original code."""
-        
+    def apply_fix_to_file(self, file_path: Path, fixed_code: str, create_backup: bool = True) -> Dict:
+        """Write fixed code to file, optionally creating a backup."""
         try:
-            # Extract JSON from response
-            response_data = json.loads(self._extract_json(llm_response))
+            if create_backup:
+                backup_path = file_path.with_suffix(file_path.suffix + ".bak")
+                shutil.copy2(file_path, backup_path)
             
-            lines = original_code.split('\n')
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(fixed_code)
             
-            # Apply each fix (in reverse order to maintain line numbers)
-            fixes = sorted(response_data.get('fixes', []), key=lambda x: x['region'], reverse=True)
-            
-            for fix in fixes:
-                region_idx = fix['region'] - 1
-                if region_idx < len(regions):
-                    region = regions[region_idx]
-                    fixed_lines = fix['fixed_code'].split('\n')
-                    
-                    # Replace lines in original
-                    start = region['start_line'] - 1
-                    end = region['end_line']
-                    lines[start:end] = fixed_lines
-            
-            return '\n'.join(lines)
-            
+            return {'success': True, 'backup_path': str(backup_path) if create_backup else None}
         except Exception as e:
-            # If parsing fails, return original
-            return original_code
+            return {'success': False, 'error': str(e)}
+
+    def restore_from_backup(self, file_path: Path) -> bool:
+        """Restore file from its .bak version if it exists."""
+        backup_path = file_path.with_suffix(file_path.suffix + ".bak")
+        if backup_path.exists():
+            shutil.move(backup_path, file_path)
+            return True
+        return False
     
     def _get_language(self, file_path: Path) -> str:
         """Determine language from file extension."""
@@ -261,24 +299,7 @@ Return JSON with fixes for each region.
         # No code block found, return as-is
         return response.strip()
     
-    def _extract_json(self, response: str) -> str:
-        """Extract JSON from response."""
-        
-        if "```json" in response:
-            start = response.find("```json") + 7
-            end = response.find("```", start)
-            return response[start:end].strip()
-        elif "```" in response:
-            start = response.find("```") + 3
-            end = response.find("```", start)
-            return response[start:end].strip()
-        else:
-            # Try to find JSON object
-            start = response.find("{")
-            end = response.rfind("}") + 1
-            if start != -1 and end > start:
-                return response[start:end]
-            return response.strip()
+    # _extract_json replaced by utils.llm_utils.extract_json
 
     def _extract_global_context(self, code: str) -> str:
         """

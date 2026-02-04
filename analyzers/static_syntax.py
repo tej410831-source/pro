@@ -9,11 +9,13 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 class FileSyntaxError:
-    def __init__(self, message: str, parser: str, line: int = 0, column: int = 0):
+    def __init__(self, message: str = "", parser: str = "unknown", line: int = 0, column: int = 0):
         self.line = line
         self.column = column
         self.message = message
         self.parser = parser
+    
+    # Class attributes moved inside or ensured they are valid
     type: str = "syntax_error"
     severity: str = "critical"
 
@@ -26,23 +28,28 @@ class StaticSyntaxAnalyzer:
         self._init_tree_sitter()
     
     def _init_tree_sitter(self):
-        """Initialize tree-sitter parsers for Java and C++."""
+        """Initialize tree-sitter parsers for Java, C, and C++."""
         try:
             from tree_sitter import Language, Parser
             from tree_sitter_languages import get_language, get_parser
             
             # Initialize parsers for Java, C++, C, and header files
-            self.parsers = {
-                '.java': get_parser('java'),
-                '.cpp': get_parser('cpp'),
-                '.c': get_parser('c'),
-                '.h': get_parser('cpp')  # Header files use C++ parser
-            }
-            self.tree_sitter_available = True
+            # We do this one by one to catch specific failures
+            self.parsers = {}
+            for ext, lang_name in [('.java', 'java'), ('.cpp', 'cpp'), ('.c', 'c'), ('.h', 'cpp')]:
+                try:
+                    self.parsers[ext] = get_parser(lang_name)
+                except Exception as e:
+                    print(f"Warning: Failed to load tree-sitter parser for {lang_name}: {e}")
             
-        except ImportError:
-            # tree-sitter not installed, will fall back to Python only
+            if self.parsers:
+                self.tree_sitter_available = True
+            
+        except (ImportError, Exception) as e:
+            # tree-sitter not installed or version conflict
+            print(f"Warning: tree-sitter initialization failed, falling back to Python only. Error: {e}")
             self.tree_sitter_available = False
+            self.parsers = {}
     
     def analyze_file(self, file_path: Path) -> Tuple[bool, List[FileSyntaxError]]:
         """

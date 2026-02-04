@@ -21,7 +21,10 @@ class Symbol:
         file_path: Path,
         line: int,
         signature: str,
-        docstring: str = ""
+        docstring: str = "",
+        body_code: str = "",
+        parent_name: str = "",
+        attributes: List[str] = None
     ):
         self.name = name
         self.type = symbol_type
@@ -29,6 +32,9 @@ class Symbol:
         self.line = line
         self.signature = signature
         self.docstring = docstring
+        self.body_code = body_code
+        self.parent_name = parent_name
+        self.attributes = attributes or []
         self.qualified_name = ""  # Set by table builder
 
 class SymbolTableBuilder:
@@ -44,7 +50,10 @@ class SymbolTableBuilder:
         Add symbol with qualified name.
         Format: module.class.method or module.function
         """
-        symbol.qualified_name = f"{module_name}.{symbol.name}"
+        if symbol.parent_name:
+            symbol.qualified_name = f"{module_name}.{symbol.parent_name}.{symbol.name}"
+        else:
+            symbol.qualified_name = f"{module_name}.{symbol.name}"
         self.symbols[symbol.qualified_name] = symbol
     
     def get_symbol(self, qualified_name: str) -> Symbol:
