@@ -108,7 +108,7 @@ def analyze(
     # Run async analysis
     asyncio.run(run_analysis(folder, output, vllm_url, generate_fixes, analysis_mode, verbose))
 
-async def run_analysis(folder: Path, output_path: Path, vllm_url: str, generate_fixes: bool, analysis_mode: str = "full", verbose: bool = False):
+async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes: bool, analysis_mode: str = "full", verbose: bool = False):
     from core.scanner import FileScanner
     from analyzers.static_syntax import StaticSyntaxAnalyzer, FileSyntaxError
     from analyzers.syntax_fix_generator import SyntaxFixGenerator
@@ -200,91 +200,66 @@ async def run_analysis(folder: Path, output_path: Path, vllm_url: str, generate_
                 with open(file_path, 'r', encoding='utf-8') as f:
                     original_code = f.read()
                 
-                # Generate fix using vLLM
-                fix_result = await syntax_fix_generator.generate_fix(
-                    file_path, 
-                    original_code, 
-                    errors
+                # ═══════════════════════════════════════════════════════
+                # NEW: Sequential fixing (one error at a time)
+                #  ═══════════════════════════════════════════════════════
+                fix_result = await syntax_fix_generator.fix_file_sequentially(
+                    file_path,
+                    original_code,
+                    errors,
+                    interactive=True
                 )
                 
                 if fix_result['success']:
-                    proposed_fixes = fix_result['fixes']
-                    regions = fix_result['regions']
-                    accepted_fixes = []
+                    working_code = fix_result['fixed_code']
                     
-                    console.print(f"  [bold cyan]→ {len(proposed_fixes)} fixes proposed for review:[/bold cyan]")
+                    # Final validation before writing to disk
+                    console.print(f"\n  [yellow]🔍 Running final validation...[/yellow]")
+                    is_valid, remaining_errors = syntax_analyzer.analyze_code(
+                        working_code,
+                        file_path.suffix
+                    )
                     
-                    for i, fix in enumerate(proposed_fixes):
-                        region_idx = fix['region'] - 1
-                        region = regions[region_idx]
-                        explanation = fix.get('explanation', 'Fixed syntax error.')
+                    if is_valid:
+                        # Create backup and write fixed file
+                        console.print(f"  [green]✓ All errors fixed! Writing to file...[/green]")
                         
-                        # Show specific fix suggestion in a panel
-                        fix_preview = Group(
-                            Markdown(f"#### Fix {i+1} for {file_path.name} (Lines {region['start_line']}-{region['end_line']})"),
-                            Syntax(
-                                fix['fixed_code'], 
-                                language, 
-                                theme="monokai", 
-                                line_numbers=True, 
-                                start_line=region['start_line']
-                            ),
-                            f"\n[bold blue]Explanation:[/bold blue] {explanation}"
-                        )
-                        console.print(Panel(fix_preview, title=f"[bold blue]PROPOSED FIX {i+1}/{len(proposed_fixes)}[/bold blue]", border_style="blue"))
-                        
-                        if typer.confirm(f"  Apply fix {i+1}/{len(proposed_fixes)}?", default=True):
-                            accepted_fixes.append(fix)
-                            console.print(f"  [green]✔ Fix {i+1} accepted.[/green]")
-                        else:
-                            console.print(f"  [yellow]✘ Fix {i+1} rejected.[/yellow]")
-
-                    if accepted_fixes:
-                        console.print(f"\n  [yellow]🔧 Applying {len(accepted_fixes)} accepted fix(es)...[/yellow]")
-                        fixed_code = syntax_fix_generator.apply_fixes(original_code, regions, accepted_fixes)
-                        
-                        # Validate the fix using static analyzer (must be error free)
-                        is_fixed_valid, remaining_errors = syntax_analyzer.analyze_code(
-                            fixed_code, 
-                            file_path.suffix
+                        apply_result = syntax_fix_generator.apply_fix_to_file(
+                            file_path,
+                            working_code,
+                            create_backup=True
                         )
                         
-                        if is_fixed_valid:
-                            # Apply to file (creates backup)
-                            apply_result = syntax_fix_generator.apply_fix_to_file(
-                                file_path,
-                                fixed_code,
-                                create_backup=True
-                            )
+                        if apply_result['success']:
+                            # Re-validate actual file on disk
+                            final_valid, final_errors = syntax_analyzer.analyze_file(file_path)
                             
-                            if apply_result['success']:
-                                # Re-validate the actual file on disk
-                                final_valid, final_errors = syntax_analyzer.analyze_file(file_path)
+                            if final_valid:
+                                syntax_fixes[str(file_path)] = {
+                                    "original_code": original_code,
+                                    "fixed_code": working_code,
+                                    "fixes_total": len(errors),
+                                    "fixes_accepted": fix_result['errors_fixed'],
+                                    "backup_path": apply_result.get('backup_path')
+                                }
                                 
-                                if final_valid:
-                                    syntax_fixes[str(file_path)] = {
-                                        "original_code": original_code,
-                                        "fixed_code": fixed_code,
-                                        "fixes_total": len(proposed_fixes),
-                                        "fixes_accepted": len(accepted_fixes),
-                                        "backup_path": apply_result.get('backup_path')
-                                    }
-                                    
-                                    applied_fixes[str(file_path)] = True
-                                    valid_files.append(file_path)
-                                    console.print(f"  [green]✅ File {file_path.name} successfully updated and verified.[/green]\n")
-                                else:
-                                    # Rollback!
-                                    syntax_fix_generator.restore_from_backup(file_path)
-                                    console.print(f"  [yellow]⚠️ Final on-disk verification failed! Restored backup.[/yellow]\n")
+                                applied_fixes[str(file_path)] = True
+                                valid_files.append(file_path)
+                                console.print(f"  [green]✅ File {file_path.name} successfully updated and verified.[/green]\n")
                             else:
-                                console.print(f"  [red]✗ Failed to write fix to disk: {apply_result.get('error', 'Unknown')}[/red]\n")
+                                # Rollback!
+                                syntax_fix_generator.restore_from_backup(file_path)
+                                console.print(f"  [yellow]⚠️ Final on-disk verification failed! Restored backup.[/yellow]\n")
                         else:
-                            console.print(f"  [yellow]⚠️ Merged fix still has {len(remaining_errors)} errors. Skipping apply.[/yellow]\n")
+                            console.print(f"  [red]✗ Failed to write fix to disk: {apply_result.get('error', 'Unknown')}[/red]\n")
                     else:
-                        console.print(f"  [yellow]⏩ No fixes accepted for {file_path.name}.[/yellow]\n")
+                        # Still has errors after all fixes
+                        console.print(f"  [yellow]⚠️  Final validation found {len(remaining_errors)} remaining error(s). Not writing to file.[/yellow]")
+                        for err in remaining_errors:
+                            console.print(f"    - Line {err.line}: {err.message}")
+                        console.print("")
                 else:
-                    console.print(f"  [red]✗ LLM fix failed: {fix_result.get('error', 'Unknown')}[/red]\n")
+                    console.print(f"  [yellow]⚠️ No fixes applied (all rejected or failed).[/yellow]\n")
             
             except Exception as e:
                 console.print(f"  [red]✗ Exceptional error during fix: {e}[/red]\n")

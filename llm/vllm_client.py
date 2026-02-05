@@ -15,7 +15,7 @@ class VLLMClient:
             api_key="EMPTY"
         )
         self.model = model
-        self.cache = {}  # Simple in-memory cache
+        self.cache = {}  # Disabled persistent caching per user request
     
     async def generate_completion(
         self, 

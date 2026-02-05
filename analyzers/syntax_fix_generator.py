@@ -1,8 +1,9 @@
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import json
 import shutil
-from utils.llm_utils import extract_json, robust_json_load
+from utils.llm_utils import extract_json, robust_json_load, extract_xml_fixes, extract_code_from_markdown
+from utils.diff_analyzer import DiffAnalyzer, Change
 
 class SyntaxFixGenerator:
     """Generate fixes for syntax errors using vLLM with smart context extraction."""
@@ -13,6 +14,7 @@ class SyntaxFixGenerator:
     
     def __init__(self, llm_client):
         self.llm_client = llm_client
+        self.diff_analyzer = DiffAnalyzer()
     
     async def generate_fix(
         self, 
@@ -31,16 +33,396 @@ class SyntaxFixGenerator:
         Returns:
             Dict with 'success', 'fixed_code', and 'method' keys
         """
+        # Skip LLM for trivial unterminated string errors
+        skip_result = self._check_skip_llm(code, errors)
+        if skip_result:
+            return skip_result
+            
+        # Use LLM for regional fixes
+        return await self._fix_regions(file_path, code, errors)
+    
+    async def fix_file_sequentially(
+        self,
+        file_path: Path,
+        code: str,
+        errors: List,
+        interactive: bool = True
+    ) -> Dict:
+        """
+        Fix syntax errors one at a time with in-memory patching.
+        
+        NEW sequential workflow:
+        1. Show all errors in table
+        2. For each error: LLM fix → user review → apply patch (in memory)
+        3. Final validation after all patches
+        4. Return fixed code (caller writes to file)
+        
+        Args:
+            file_path: Path to file
+            code: Original code with syntax errors
+            errors: List of FileSyntaxError objects
+            interactive: If True, ask user for approval
+        
+        Returns:
+            {
+                'success': bool,
+                'fixed_code': str,
+                'errors_fixed': int,
+                'errors_skipped': int,
+                'patches': List[Dict]
+            }
+        """
+        working_code = code
+        patches_applied = []
+        errors_fixed = 0
+        errors_skipped = 0
+        
+        print(f"\n🔍 Found {len(errors)} syntax error(s) in {file_path.name}")
+        print(f"\n{'Line':<8} {'Error Type':<15} {'Message'}")
+        print("─" * 70)
+        for err in errors:
+            err_type = err.parser if hasattr(err, 'parser') else 'SyntaxError'
+            print(f"{err.line:<8} {err_type:<15} {err.message[:50]}")
+        print()
+        
+        # Process each error sequentially
+        for idx, error in enumerate(errors, 1):
+            print(f"\n→ Fixing error {idx}/{len(errors)} (Line {error.line})...")
+            
+            try:
+                fix_result = await self._fix_single_error(
+                    working_code,
+                    error,
+                    file_path
+                )
+                
+                if not fix_result['success']:
+                    print(f"  ✗ Failed: {fix_result.get('error', 'Unknown')}")
+                    errors_skipped += 1
+                    continue
+                
+                region = fix_result['region']
+                fixed_code = fix_result['fixed_code']
+                explanation = fix_result.get('explanation', 'Fixed syntax error.')
+                
+                print(f"  📝 Proposed fix for lines {region['start_line']}-{region['end_line']}:")
+                print(f"  ℹ️  {explanation}\n")
+                
+                # User approval (if interactive)
+                if interactive:
+                    response = input(f"  Apply fix {idx}/{len(errors)}? [Y/n]: ").strip().lower()
+                    if response and response != 'y':
+                        print(f"  ✗ Fix {idx} rejected")
+                        errors_skipped += 1
+                        continue
+                
+                # Apply patch in memory
+                working_code = self.apply_patch_to_code(
+                    working_code,
+                    region,
+                    fixed_code
+                )
+                
+                patches_applied.append({
+                    'error_line': error.line,
+                    'region': region,
+                    'explanation': explanation
+                })
+                
+                errors_fixed += 1
+                print(f"  ✓ Fix {idx} applied to working code")
+                
+            except Exception as e:
+                print(f"  ✗ Error: {str(e)}")
+                errors_skipped += 1
+        
+        print(f"\n📊 Applied {errors_fixed}/{len(errors)} fixes")
+        
+        return {
+            'success': errors_fixed > 0,
+            'fixed_code': working_code,
+            'errors_fixed': errors_fixed,
+            'errors_skipped': errors_skipped,
+            'patches': patches_applied
+        }
+    
+    async def _fix_single_error(self, code: str, error, file_path: Path) -> Dict:
+        """
+        Fix a single syntax error with focused context.
+        
+        Args:
+            code: Current code (may have previous patches)
+            error: Single FileSyntaxError
+            file_path: Path (for language detection)
+        
+        Returns:
+            {
+                'success': bool,
+                'fixed_code': str,  # Fixed region only
+                'region': Dict,
+                'explanation': str
+            }
+        """
+        language = self._get_language(file_path)
+        lines = code.split('\n')
+        error_line = error.line - 1
+        
+        # Find enclosing block
+        start_line, end_line = self._find_enclosing_block(lines, error_line)
+        region_lines = lines[start_line:end_line]
+        region_code = '\n'.join(region_lines)
+        
+        region = {
+            'error': error,
+            'code': region_code,
+            'start_line': start_line + 1,
+            'end_line': end_line,
+            'error_line_in_region': error_line - start_line + 1
+        }
+        
+        # Build prompt for SINGLE error
+        prompt = f"""Fix this {language} syntax error:
+
+Error: Line {error.line}: {error.message}
+
+Code (lines {region['start_line']}-{region['end_line']}):
+{region_code}
+
+CRITICAL: Return ONLY the FIXED code. Use this XML format:
+
+<FIX>
+    <CODE>
+    [Complete fixed code - no markdown, no backticks]
+    </CODE>
+    <EXPLANATION>[Brief explanation]</EXPLANATION>
+</FIX>
+
+RULES:
+1. Output ONLY ONE <FIX> tag
+2. Inside <CODE>, put raw fixed code (no backticks)
+3. Preserve original indentation unless it causes the error
+"""
+        
+        try:
+            response = await self.llm_client.generate_completion(prompt, temperature=0.1)
+            
+            # Try XML then markdown
+            response_data = extract_xml_fixes(response)
+            if not response_data:
+                response_data = extract_code_from_markdown(response, num_regions=1)
+            
+            if not response_data or not response_data.get('fixes'):
+                raise ValueError("Could not parse LLM response")
+            
+            fix = response_data['fixes'][0]
+            fixed_code = fix['fixed_code']
+            explanation = fix.get('explanation', 'Fixed syntax error.')
+            
+            # Apply context-aware indentation
+            expected_indent = self._get_expected_base_indent(code, region)
+            fixed_code = self._force_base_indent(fixed_code, expected_indent)
+            
+            return {
+                'success': True,
+                'fixed_code': fixed_code,
+                'region': region,
+                'explanation': explanation
+            }
+            
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e),
+                'region': region
+            }
+    
+    def apply_patch_to_code(self, original_code: str, region: Dict, fixed_code: str) -> str:
+        """
+        Replace region in original_code with fixed_code.
+        
+        Args:
+            original_code: Full file content
+            region: {'start_line': int, 'end_line': int} (1-indexed)
+            fixed_code: Replacement code for region
+        
+        Returns:
+            Patched full file content
+        """
+        lines = original_code.split('\n')
+        start_idx = region['start_line'] - 1
+        end_idx = region['end_line']
+        fixed_lines = fixed_code.split('\n')
+        
+        patched_lines = lines[:start_idx] + fixed_lines + lines[end_idx:]
+        return '\n'.join(patched_lines)
+    
+    def _check_skip_llm(self, code: str, errors: List) -> Optional[Dict]:
+        """Check if errors are trivial and should skip LLM, returning helpful message instead."""
+        lines = code.split('\n')
+        
+        for error in errors:
+            # Check for unterminated triple-quotes
+            if "unterminated" in error.message.lower() and "string" in error.message.lower():
+                line_idx = error.line - 1
+                if 0 <= line_idx < len(lines):
+                    line = lines[line_idx]
+                    if '"""' in line and line.count('"""') % 2 != 0:
+                        # Return message instead of fix
+                        print(f"\n⚠️  Trivial Error Detected:")
+                        print(f"   File: Line {error.line}")
+                        print(f"   Error: {error.message}")
+                        print(f"   Code: {line.strip()}")
+                        print(f"   Fix: Please close the string with ''' (triple quotes)")
+                        return {
+                            'success': False,
+                            'skip_llm': True,
+                            'message': 'Trivial error - user should fix manually'
+                        }
+        return None
+    
+    def _normalize_indentation(self, fixed_code: str, region: Dict) -> str:
+        """
+        Normalize indentation of LLM output to match original region, PRESERVING relative structure.
+        
+        Key improvement: Instead of flattening all lines to one base indent, this preserves
+        the RELATIVE indentation differences (e.g., method def vs method body).
+        
+        Args:
+            fixed_code: Code returned by LLM
+            region: Original region dict with 'code', 'start_line', 'end_line'
+            
+        Returns:
+            Code with corrected indentation preserving internal structure
+        """
+        if not fixed_code or not fixed_code.strip():
+            return fixed_code
+            
+        # Get original and fixed lines
+        original_lines = region['code'].split('\n')
+        fixed_lines = fixed_code.split('\n')
+        
+        # Find minimum indentation in ORIGINAL code (our baseline)
+        original_min_indent = float('inf')
+        for line in original_lines:
+            if line.strip():  # Skip empty lines
+                indent = len(line) - len(line.lstrip())
+                original_min_indent = min(original_min_indent, indent)
+        
+        if original_min_indent == float('inf'):
+            original_min_indent = 0
+        
+        # Find minimum indentation in FIXED code (LLM's baseline)
+        fixed_min_indent = float('inf')
+        for line in fixed_lines:
+            if line.strip():
+                indent = len(line) - len(line.lstrip())
+                fixed_min_indent = min(fixed_min_indent, indent)
+        
+        if fixed_min_indent == float('inf'):
+            return fixed_code  # All empty lines
+        
+        # Calculate offset: how much to shift ALL lines
+        indent_offset = original_min_indent - fixed_min_indent
+        
+        # Apply offset to each line, preserving relative differences
+        normalized_lines = []
+        for line in fixed_lines:
+            if not line.strip():
+                # Keep empty lines empty
+                normalized_lines.append('')
+            else:
+                # Current indent + offset
+                current_indent = len(line) - len(line.lstrip())
+                new_indent = max(0, current_indent + indent_offset)
+                
+                # Reconstruct line with new indent
+                content = line.lstrip()
+                normalized_lines.append(' ' * new_indent + content)
+        
+        return '\n'.join(normalized_lines)
+    
+    def _get_expected_base_indent(self, full_code: str, region: Dict) -> int:
+        """
+        Calculate the CORRECT base indentation by analyzing where the region
+        sits in the file structure (inside a class, top-level, etc).
+        
+        Args:
+            full_code: Complete file source code
+            region: Error region dict with 'start_line'
+            
+        Returns:
+            Expected base indentation in spaces
+        """
+        lines = full_code.split('\n')
+        region_start = region['start_line'] - 1  # 0-indexed
+        
+        # Scan backwards from region start to find parent block
+        for i in range(region_start - 1, -1, -1):
+            line = lines[i].rstrip()
+            if not line or line.strip().startswith('#'):
+                continue  # Skip empty and comment lines
+            
+            stripped = line.lstrip()
+            
+            # Check for class or function definition
+            if (stripped.startswith('class ') or 
+                stripped.startswith('def ') or
+                stripped.startswith('template') or  # C++ templates
+                'class ' in stripped):  # Java/C++ classes
+                
+                # Found parent - calculate its indent
+                parent_indent = len(line) - len(stripped)
+                
+                # Child elements are indented +4 from parent
+                return parent_indent + 4
+        
+        # No parent found - this is top-level code
+        return 0
+    
+    def _force_base_indent(self, code: str, expected_base_indent: int) -> str:
+        """
+        Force code to have the specified base indentation, preserving relative structure.
+        
+        This is different from _normalize_indentation - it doesn't use the buggy original
+        as reference, instead it uses the CALCULATED expected indent from file structure.
+        
+        Args:
+            code: LLM-generated code (may have wrong base indent)
+            expected_base_indent: Correct base indent (from _get_expected_base_indent)
+            
+        Returns:
+            Code with correct base indent, relative structure preserved
+        """
+        if not code or not code.strip():
+            return code
         
         lines = code.split('\n')
         
-        # Choose strategy based on file size
-        if len(lines) <= self.MAX_LINES_FOR_WHOLE_FILE:
-            # Small file: send whole thing
-            return await self._fix_whole_file(file_path, code, errors)
-        else:
-            # Large file: regional fixing
-            return await self._fix_regions(file_path, code, errors)
+        # Find minimum indent in LLM output
+        min_indent = float('inf')
+        for line in lines:
+            if line.strip():
+                indent = len(line) - len(line.lstrip())
+                min_indent = min(min_indent, indent)
+        
+        if min_indent == float('inf'):
+            return code  # All empty lines
+        
+        # Calculate how much to shift
+        offset = expected_base_indent - min_indent
+        
+        # Apply offset, preserving relative indentation
+        result_lines = []
+        for line in lines:
+            if not line.strip():
+                result_lines.append('')
+            else:
+                current_indent = len(line) - len(line.lstrip())
+                new_indent = max(0, current_indent + offset)
+                content = line.lstrip()
+                result_lines.append(' ' * new_indent + content)
+        
+        return '\n'.join(result_lines)
     
     def apply_fixes(self, original_code: str, regions: List[Dict], selected_fixes: List[Dict]) -> str:
         """Apply a subset of fixes to the original code."""
@@ -63,6 +445,43 @@ class SyntaxFixGenerator:
         
         return '\n'.join(lines)
     
+    def apply_selective_changes(self, original_code: str, selected_changes: List[Change]) -> str:
+        """
+        Apply only user-approved changes to the original code.
+        
+        Args:
+            original_code: Original code with errors
+            selected_changes: List of Change objects that user approved
+        
+        Returns:
+            Code with only approved changes applied
+        """
+        if not selected_changes:
+            return original_code
+        
+        lines = original_code.splitlines()
+        
+        # Sort changes by line number (reverse) to maintain line offsets
+        sorted_changes = sorted(selected_changes, key=lambda c: c.line_start, reverse=True)
+        
+        for change in sorted_changes:
+            start_idx = change.line_start - 1  # Convert to 0-indexed
+            end_idx = change.line_end  # Exclusive end
+            
+            if change.type == 'add':
+                # Insert new lines
+                lines[start_idx:start_idx] = change.fixed_lines
+            
+            elif change.type == 'delete':
+                # Remove lines
+                del lines[start_idx:end_idx]
+            
+            elif change.type == 'modify':
+                # Replace lines
+                lines[start_idx:end_idx] = change.fixed_lines
+        
+        return '\n'.join(lines)
+    
     async def _fix_whole_file(self, file_path: Path, code: str, errors: List) -> Dict:
         """Fix small files by sending entire content."""
         
@@ -70,42 +489,54 @@ class SyntaxFixGenerator:
         
         # Format errors
         error_details = '\n'.join([
-            f"  - Line {e.line}, Column {e.column}: {e.message}"
+            f"Line {e.line}: {e.message}"
             for e in errors
         ])
-        
-        prompt = f"""You are an expert {language} developer. Fix ALL syntax errors below.
 
-**File:** {file_path.name}
+        prompt = f"""Fix the syntax errors in this {language} code.
 
-**Syntax Errors:**
+Errors:
 {error_details}
 
-**Code with Errors:**
-```{language}
+Code:
 {code}
-```
 
-**Task:** Fix ALL syntax errors. Return the corrected code and a brief explanation of what was changed.
-
-**Response Format (JSON):**
-Return a JSON object with EXACTLY two keys: "fixed_code" and "explanation". 
-IMPORTANT: Use double backslashes for newlines in fixed_code strings, or ensure the response is valid JSON that can be parsed by `json.loads`.
-
-{{
-  "fixed_code": "def example():\\n    print('fixed')",
-  "explanation": "Brief description"
-}}
-"""
+Return JSON with "fixed_code" and "explanation" keys."""
+        
         
         try:
-            response = await self.llm_client.generate_completion(prompt, temperature=0.1)
-            fix_data = json.loads(extract_json(response))
+            response = await self.llm_client.generate_completion(
+                prompt, 
+                temperature=0.0,
+                max_tokens=10000 #ure sufficient tokens for complete file
+            )
+            
+            # Debug: Log raw LLM response (first 500 chars)
+            print(f"[DEBUG] Raw LLM Response (first 500 chars): {response[:500]}")
+            
+            fix_data = robust_json_load(response)
+            
+            if not fix_data:
+                print(f"[DEBUG] Failed to parse LLM response. Full response:\n{response}")
+                return {
+                    'success': False,
+                    'error': 'Could not parse LLM response (all fallback stages failed)',
+                    'method': 'whole_file'
+                }
+            
+            
+            # Compute granular changes for user approval
+            fixed_code = fix_data.get('fixed_code', '')
+            
+            # Note: For whole-file fixes, normalization is skipped as the entire context is already known
+            # The LLM sees the full file, so indentation should already be correct
+
+            changes = self.diff_analyzer.compute_changes(code, fixed_code)
             
             # For whole file, we treat it as a single region covering everything
             fix_obj = {
                 'region': 1,
-                'fixed_code': fix_data.get('fixed_code', ''),
+                'fixed_code': fixed_code,
                 'explanation': fix_data.get('explanation', 'Fixed syntax errors.')
             }
             
@@ -122,6 +553,9 @@ IMPORTANT: Use double backslashes for newlines in fixed_code strings, or ensure 
                 'success': True,
                 'fixes': [fix_obj],
                 'regions': [region_obj],
+                'changes': changes,  # NEW: Granular changes for approval
+                'original_code': code,  # NEW: Keep original for selective merge
+                'fixed_code': fixed_code,  # NEW: Complete fixed version
                 'method': 'whole_file'
             }
         except Exception as e:
@@ -143,10 +577,31 @@ IMPORTANT: Use double backslashes for newlines in fixed_code strings, or ensure 
         try:
             # Get fixes from LLM
             response = await self.llm_client.generate_completion(prompt, temperature=0.1)
-            response_data = robust_json_load(response)
+            print(f"[DEBUG] Raw Regional Response: {response[:1000]}") # DEBUG LOG
+            
+            # Try XML parsing first
+            response_data = extract_xml_fixes(response)
+            
+            # If XML fails, try markdown fallback
             if not response_data:
-                raise ValueError("Could not parse LLM response")
+                print(f"[DEBUG] XML parsing failed. Trying markdown fallback...")
+                response_data = extract_code_from_markdown(response, num_regions=len(regions))
+            
+            # If both fail, raise error
+            if not response_data:
+                print(f"[DEBUG] Both XML and markdown parsing failed. Raw: {response[:500]}")
+                raise ValueError("Could not parse LLM response (tried XML and markdown)")
+                
             fixes = response_data.get('fixes', [])
+            
+            # Apply context-aware indentation correction
+            # Calculate expected indent from file structure, not buggy original
+            for i, fix in enumerate(fixes):
+                if 'fixed_code' in fix and i < len(regions):
+                    # Calculate where this code SHOULD be indented based on file structure
+                    expected_indent = self._get_expected_base_indent(code, regions[i])
+                    # Force LLM output to this calculated indent
+                    fix['fixed_code'] = self._force_base_indent(fix['fixed_code'], expected_indent)
 
             return {
                 'success': True,
@@ -170,9 +625,8 @@ IMPORTANT: Use double backslashes for newlines in fixed_code strings, or ensure 
         for error in errors:
             error_line = error.line - 1  # Convert to 0-indexed
             
-            # Calculate context window
-            start_line = max(0, error_line - self.CONTEXT_LINES_BEFORE)
-            end_line = min(len(lines), error_line + self.CONTEXT_LINES_AFTER + 1)
+            # Smart Context: Try to find enclosing class/function
+            start_line, end_line = self._find_enclosing_block(lines, error_line)
             
             # Extract region
             region_lines = lines[start_line:end_line]
@@ -187,60 +641,126 @@ IMPORTANT: Use double backslashes for newlines in fixed_code strings, or ensure 
             })
         
         return regions
+
+    def _find_enclosing_block(self, lines: List[str], target_idx: int) -> Tuple[int, int]:
+        """Find the start/end of the enclosing class or function using indentation."""
+        start_idx = max(0, target_idx - self.CONTEXT_LINES_BEFORE)
+        end_idx = min(len(lines), target_idx + self.CONTEXT_LINES_AFTER + 1)
+        
+        # Determine indentation of the target line
+        target_line = lines[target_idx]
+        if not target_line.strip():
+            # If line is empty, look around for context indentation? 
+            # Or just assume it's same as previous non-empty line
+            target_indent = 0
+            for i in range(target_idx - 1, -1, -1):
+                if lines[i].strip():
+                    target_indent = len(lines[i]) - len(lines[i].lstrip())
+                    break
+        else:
+            target_indent = len(target_line) - len(target_line.lstrip())
+            
+        found_block = False
+        base_indent = 0
+        current_best_start = -1
+        
+        # 1. Search UPWARDS for 'class' or 'def' with LOWER indentation
+        for i in range(target_idx, -1, -1):
+            line = lines[i]
+            if not line.strip(): continue
+            
+            stripped = line.lstrip()
+            indent = len(line) - len(stripped)
+            
+            # Enclosing block must be OUTER (less indentation)
+            # Unless strict nesting isn't valid (e.g. one-liners), but generally true.
+            if indent < target_indent:
+                if stripped.startswith("class "):
+                    current_best_start = i
+                    base_indent = indent
+                    found_block = True
+                    break # Priority to class
+                elif stripped.startswith("def ") and current_best_start == -1:
+                    current_best_start = i
+                    base_indent = indent
+                    found_block = True
+            
+            # Stop if we hit 0 indent and handled it
+            if indent == 0 and i < target_idx and not found_block:
+                # If we passed root and found nothing, stop
+                pass 
+                
+        if found_block:
+            start_idx = current_best_start
+            
+            # 2. Search DOWNWARDS for end of block (indent <= base_indent)
+            end_search_start = target_idx + 1
+            max_lines = len(lines)
+            end_idx = max_lines
+            
+            for i in range(end_search_start, max_lines):
+                line = lines[i]
+                if not line.strip(): continue
+                
+                stripped = line.lstrip()
+                indent = len(line) - len(stripped)
+                
+                if indent <= base_indent:
+                    end_idx = i
+                    break
+                    
+        return start_idx, end_idx
     
     def _build_regional_prompt(self, file_path: Path, regions: List[Dict], errors: List, original_code: str) -> str:
         """Build prompt with error regions and global context."""
         
         language = self._get_language(file_path)
         
-        # Extract global context (imports, constants)
-        global_context = self._extract_global_context(original_code)
-        
-        # Build regions section
+        # Build minimal regions section
         regions_text = []
         for i, region in enumerate(regions, 1):
             error = region['error']
-            regions_text.append(f"""
-**Error Region {i}:**
-- Line {error.line}: {error.message}
-- Code (lines {region['start_line']}-{region['end_line']}):
-
-```{language}
+            regions_text.append(f"""Region {i}:
+Error: Line {error.line}: {error.message}
+Code (lines {region['start_line']}-{region['end_line']}):
 {region['code']}
-```
 """)
         
         regions_str = '\n'.join(regions_text)
         
-        return f"""You are an expert {language} developer. Fix the syntax errors in each region below.
-
-**File:** {file_path.name}
-
-**Global Context (Imports & Constants):**
-```{language}
-{global_context}
-```
+        return f"""Fix these {language} syntax errors:
 
 {regions_str}
 
-**Task:** For each error region, provide the FIXED version.
-Return JSON with fixes for each region.
+CRITICAL: You MUST return ONLY XML tags. Do NOT use markdown code blocks (```). Do NOT add explanatory text outside the XML structure.
 
-**Response Format:**
-{{
-  "fixes": [
-    {{
-      "region": 1, 
-      "fixed_code": "...",
-      "explanation": "<brief explanation of fix for this region>"
-    }},
-    {{
-      "region": 2, 
-      "fixed_code": "...",
-      "explanation": "..."
-    }}
-  ]
+Return output using EXACTLY this XML format:
+
+<FIX>
+    <REGION>1</REGION>
+    <CODE>
+    [Insert the COMPLETE fixed code here - no markdown, no backticks, just raw code]
+    </CODE>
+    <EXPLANATION>[Brief one-sentence explanation]</EXPLANATION>
+</FIX>
+
+RULES:
+1. Output ONLY <FIX> tags. No markdown. No ```cpp or ```python blocks.
+2. Inside <CODE>, put the raw fixed code directly. Do NOT wrap it in backticks.
+3. Preserve original block indentation unless it causes syntax errors (top-level code = 0 indent).
+4. For multiple regions, return multiple <FIX> blocks.
+
+Example (for C++):
+<FIX>
+    <REGION>1</REGION>
+    <CODE>
+#include <iostream>
+void log_message(std::string msg) {{
+    std::cout << "[LOG] " << msg << std::endl;
 }}
+    </CODE>
+    <EXPLANATION>Fixed missing semicolon and corrected operator.</EXPLANATION>
+</FIX>
 """
     
     def apply_fix_to_file(self, file_path: Path, fixed_code: str, create_backup: bool = True) -> Dict:
@@ -325,3 +845,64 @@ Return JSON with fixes for each region.
                     context_lines.append(line)
         
         return '\n'.join(context_lines)
+
+    def _clean_code(self, code: str) -> str:
+        """
+        Post-process LLM output to remove visual artifacts we injected into the prompt.
+        Handles:
+        1. <--- ERROR markers
+        2. >> pointers
+        3. Line number prefixes (e.g., '  12 | ')
+        4. Accidental indentation
+        """
+        import re
+        import textwrap
+        
+        if not code:
+            return ""
+            
+        # 0. Fix literal newlines (common in regex-extracted JSON)
+        code = code.replace('\\n', '\n')
+            
+        lines = code.split('\n')
+        clean_lines = []
+        for line in lines:
+            # 1. Strip tail markers
+            if "<--- ERROR" in line:
+                line = line.split("<--- ERROR")[0].rstrip()
+            
+            # 2. Strip lead pointers (conservative)
+            # Only if line starts with >> 
+            if line.strip().startswith(">> "):
+                line = line.replace(">> ", "", 1)
+                
+            # 3. Strip line numbers (e.g. "   12 | code")
+            # Regex: Start of line, optional space, digits, space, pipe, optional space
+            # Be careful not to match actual code like "1 | 2"
+            # We assume line numbers are at the very start
+            line = re.sub(r'^\s*\d+\s*\|\s?', '', line)
+            
+            clean_lines.append(line)
+        
+        cleaned = '\n'.join(clean_lines)
+        
+        # 4. Dedent (if the whole block was indented)
+        cleaned = textwrap.dedent(cleaned)
+        
+        # 5. Normalize Indentation (Heuristic)
+        # Round leading spaces to nearest 4 to fix "off-by-one" errors from LLMs (e.g. 5 spaces vs 4)
+        normalized_lines = []
+        for line in cleaned.split('\n'):
+            stripped = line.lstrip()
+            if not stripped:
+                normalized_lines.append("")
+                continue
+                
+            leading_spaces = len(line) - len(stripped)
+            # Round to nearest 4
+            rounded = round(leading_spaces / 4) * 4
+            normalized_lines.append(" " * rounded + stripped)
+            
+        cleaned = '\n'.join(normalized_lines)
+        
+        return cleaned
