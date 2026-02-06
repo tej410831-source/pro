@@ -8,26 +8,11 @@ from pathlib import Path
 from typing import List, Dict, Any
 
 class StructuralParser:
-    """Extracts structural information from source files using AST and tree-sitter."""
+    """Extracts structural information from source files using AST."""
 
     def __init__(self):
-        self.tree_sitter_available = False
-        self.parsers = {}
-        self._init_tree_sitter()
-
-    def _init_tree_sitter(self):
-        """Initialize tree-sitter parsers for Java, C, and C++."""
-        try:
-            from tree_sitter_languages import get_parser
-            for ext, lang_name in [('.java', 'java'), ('.cpp', 'cpp'), ('.c', 'c'), ('.h', 'cpp')]:
-                try:
-                    self.parsers[ext] = get_parser(lang_name)
-                except:
-                    pass
-            if self.parsers:
-                self.tree_sitter_available = True
-        except ImportError:
-            self.tree_sitter_available = False
+        # Pure Python parser - no initialization needed
+        pass
 
     def parse_python(self, code: str, file_path: Path) -> Dict[str, Any]:
         """
@@ -121,6 +106,9 @@ class StructuralParser:
                 self.current_function = prev_func
                 self.calls_in_current = prev_calls
 
+            # Alias for async definitions
+            visit_AsyncFunctionDef = visit_FunctionDef
+
             def visit_Call(self, node):
                 call_name = None
                 if isinstance(node.func, ast.Name):
@@ -142,84 +130,4 @@ class StructuralParser:
             "classes": analyzer.classes,
             "imports": analyzer.imports,
             "calls": all_calls
-        }
-
-    def parse_tree_sitter(self, code: str, file_path: Path) -> Dict[str, Any]:
-        """Parse Java/C/C++ using tree-sitter."""
-        ext = file_path.suffix
-        parser = self.parsers.get(ext)
-        if not parser or not self.tree_sitter_available:
-            return {"functions": [], "classes": [], "imports": [], "calls": []}
-
-        tree = parser.parse(bytes(code, "utf8"))
-        root = tree.root_node
-
-        functions = []
-        classes = []
-        calls = []
-        
-        # Track current function for call mapping
-        self._current_calls = []
-
-        def traverse(node):
-            node_type = node.type
-            
-            # Identify Functions/Methods
-            if node_type in ("method_declaration", "function_definition"):
-                name_node = node.child_by_field_name("name") or node.child_by_field_name("declarator")
-                if name_node:
-                    # Deep extraction for C declarators
-                    while name_node.child_by_field_name("declarator"):
-                        name_node = name_node.child_by_field_name("declarator")
-                    
-                    name = code[name_node.start_byte:name_node.end_byte]
-                    
-                    prev_calls = self._current_calls
-                    self._current_calls = []
-                    
-                    for child in node.children:
-                        traverse(child)
-                    
-                    functions.append({
-                        "name": name,
-                        "line": node.start_point[0] + 1,
-                        "signature": f"{name}(...)",
-                        "calls": self._current_calls
-                    })
-                    self._current_calls = prev_calls
-                    return # Already recursed
-
-            # Identify Classes
-            elif node_type in ("class_declaration", "class_specifier", "struct_specifier"):
-                name_node = node.child_by_field_name("name")
-                if name_node:
-                    name = code[name_node.start_byte:name_node.end_byte]
-                    classes.append({
-                        "name": name,
-                        "line": node.start_point[0] + 1
-                    })
-
-            # Identify Calls
-            elif node_type in ("method_invocation", "call_expression"):
-                name_node = node.child_by_field_name("name") or node.child_by_field_name("function")
-                if name_node:
-                    name = code[name_node.start_byte:name_node.end_byte]
-                    # Handle method calls obj.func()
-                    if "." in name:
-                        name = name.split(".")[-1]
-                    if "->" in name:
-                        name = name.split("->")[-1]
-                        
-                    self._current_calls.append(name)
-                    calls.append(name)
-
-            for child in node.children:
-                traverse(child)
-
-        traverse(root)
-        return {
-            "functions": functions,
-            "classes": classes,
-            "imports": [], # Import extraction is more complex in C/Java
-            "calls": calls
         }

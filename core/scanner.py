@@ -10,7 +10,7 @@ from typing import List
 class FileScanner:
     def __init__(self, root_path: Path):
         self.root_path = root_path
-        self.extensions = {'.py', '.java', '.cpp', '.c', '.h'}  # Python, Java, C/C++
+        self.extensions = {'.py'}  # Python only
         self.ignore_dirs = {
             '.git', 'node_modules', '__pycache__', 'venv', '.venv',
             'build', 'dist', '.tox', '.mypy_cache', '.pytest_cache',

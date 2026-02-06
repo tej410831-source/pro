@@ -32,13 +32,16 @@ class LLMBugDetector:
         file_path: Path,
         class_context: str = "",
         dependency_hints: str = "",
+        global_vars: str = "",
+        imports_list: str = "",
         verbose: bool = False
     ) -> List[SemanticBug]:
         """
         Analyze a specific symbol (function/method) with focused context.
         """
         prompt = self._build_focused_prompt(
-            symbol_name, code, language, file_path.name, class_context, dependency_hints
+            symbol_name, code, language, file_path.name, 
+            class_context, dependency_hints, global_vars, imports_list
         )
         
         if verbose:
@@ -69,11 +72,23 @@ class LLMBugDetector:
 
     def _build_focused_prompt(
         self, name: str, code: str, lang: str, file: str, 
-        class_ctx: str, dep_hints: str
+        class_ctx: str, dep_hints: str, global_vars: str, imports: str
     ) -> str:
         ctx_section = ""
+        
+        # Module-level context (imports and globals)
+        if imports or global_vars:
+            ctx_section += "\n**Module Context:**\n"
+            if imports:
+                ctx_section += f"Imports:\n{imports}\n"
+            if global_vars:
+                ctx_section += f"Global Variables:\n{global_vars}\n"
+        
+        # Class context
         if class_ctx:
             ctx_section += f"\n**Class Context (Skeleton):**\n```{lang}\n{class_ctx}\n```\n"
+        
+        # Cross-file dependencies
         if dep_hints:
             ctx_section += f"\n**External Dependency Hints:**\n{dep_hints}\n"
 
@@ -92,6 +107,7 @@ Analyze the target code block below and identify ONLY concrete, actionable bugs.
 1. Potential crashes, runtime errors, or logic flaws.
 2. Cross-file inconsistencies (use the Dependency Hints provided).
 3. Security vulnerabilities.
+4. Type mismatches between function calls and signatures.
 
 **Ignore:** Style, formatting, or minor optimizations.
 

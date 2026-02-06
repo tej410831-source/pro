@@ -41,6 +41,81 @@ class SyntaxFixGenerator:
         # Use LLM for regional fixes
         return await self._fix_regions(file_path, code, errors)
     
+    async def fix_file_manual_assist(
+        self,
+        file_path: Path,
+        code: str,
+        errors: List
+    ) -> Dict:
+        """
+        Suggest fixes for syntax errors sequentially, waiting for USER to apply them.
+        
+        Args:
+            file_path: Path to file
+            code: Original code
+            errors: List of FileSyntaxError objects
+        
+        Returns:
+            Dict with execution stats
+        """
+        print(f"\n🔍 Analysis for {file_path.name}: Found {len(errors)} error(s)")
+        print(f"{'Line':<8} {'Error Type':<15} {'Message'}")
+        print("─" * 70)
+        for err in errors:
+            err_type = err.parser if hasattr(err, 'parser') else 'SyntaxError'
+            print(f"{err.line:<8} {err_type:<15} {err.message[:60]}")
+        print()
+        
+        fixes_presented = 0
+        
+        for idx, error in enumerate(errors, 1):
+            print(f"\n════════════════════════════════════════════════════════════")
+            print(f"🔴 Error {idx}/{len(errors)} at Line {error.line}")
+            print(f"   Message: {error.message}")
+            print(f"════════════════════════════════════════════════════════════")
+            print("⏳ Generating fix...")
+            
+            try:
+                # We pass 'code' here. Since user updates manually, 'code' might be stale 
+                # if we were tracking state, but for manual mode, we just use the original 
+                # or rely on the user having the file open. 
+                # Ideally, if the user saves between steps, we should reload, but 
+                # for simplicity, we use the loaded code context for the prompt.
+                fix_result = await self._fix_single_error(
+                    code,
+                    error,
+                    file_path
+                )
+                
+                if not fix_result['success']:
+                    print(f"❌ Could not generate fix: {fix_result.get('error')}")
+                    continue
+
+                region = fix_result['region']
+                fixed_code = fix_result['fixed_code']
+                explanation = fix_result.get('explanation', 'Fixed syntax error')
+                
+                print(f"\n💡 Suggested Fix (Lines {region['start_line']}-{region['end_line']}):")
+                print(f"   ℹ️  {explanation}\n")
+                print("👇 COPY THIS CODE 👇")
+                print("────────────────────────────────────────────────────────────")
+                print(fixed_code.rstrip())
+                print("────────────────────────────────────────────────────────────")
+                
+                while True:
+                    choice = input(f"\n[User Action] Have you applied this fix? (y=next, q=quit file): ").strip().lower()
+                    if choice == 'y':
+                        fixes_presented += 1
+                        break
+                    elif choice == 'q':
+                        print("Skipping remaining errors for this file.")
+                        return {'success': True, 'fixes_presented': fixes_presented}
+            
+            except Exception as e:
+                print(f"❌ Error processing fix: {e}")
+        
+        return {'success': True, 'fixes_presented': fixes_presented}
+
     async def fix_file_sequentially(
         self,
         file_path: Path,
@@ -165,42 +240,63 @@ class SyntaxFixGenerator:
         """
         language = self._get_language(file_path)
         lines = code.split('\n')
-        error_line = error.line - 1
+        error_line_idx = error.line - 1  # 0-indexed
         
-        # Find enclosing block
-        start_line, end_line = self._find_enclosing_block(lines, error_line)
-        region_lines = lines[start_line:end_line]
-        region_code = '\n'.join(region_lines)
+        # Extract a SMALL window around the error (+/- 5 lines)
+        window_size = 5
+        start_line = max(0, error_line_idx - window_size)
+        end_line = min(len(lines), error_line_idx + window_size + 1)
+        
+        window_lines = lines[start_line:end_line]
+        error_in_window = error_line_idx - start_line
+        
+        # Build the code window with error marker
+        code_with_marker = []
+        for i, line in enumerate(window_lines):
+            if i == error_in_window:
+                code_with_marker.append(f"{line}  <--- ERROR HERE")
+            else:
+                code_with_marker.append(line)
+        
+        code_window = '\n'.join(code_with_marker)
         
         region = {
             'error': error,
-            'code': region_code,
+            'code': '\n'.join(window_lines),
             'start_line': start_line + 1,
             'end_line': end_line,
-            'error_line_in_region': error_line - start_line + 1
+            'error_line_in_region': error_in_window + 1
         }
         
-        # Build prompt for SINGLE error
+        # Build MINIMAL, focused prompt
         prompt = f"""Fix this {language} syntax error:
 
-Error: Line {error.line}: {error.message}
+ERROR at Line {error.line}: {error.message}
 
-Code (lines {region['start_line']}-{region['end_line']}):
-{region_code}
+CODE WINDOW (Lines {region['start_line']}-{region['end_line']}):
+{code_window}
 
-CRITICAL: Return ONLY the FIXED code. Use this XML format:
+TASK: Return the EXACT same code with ONLY the syntax error fixed.
 
+CRITICAL RULES:
+1. Return ALL {len(window_lines)} lines from the code window
+2. Change ONLY what's needed to fix the syntax error
+3. Do NOT add comments like "# ERROR fixed" - FIX SILENTLY
+4. Do NOT use placeholders like "..." or "// rest of code"
+5. PRESERVE all existing code exactly as-is except for the minimal syntax fix
+
+XML FORMAT:
 <FIX>
-    <CODE>
-    [Complete fixed code - no markdown, no backticks]
-    </CODE>
-    <EXPLANATION>[Brief explanation]</EXPLANATION>
+<CODE>
+[All {len(window_lines)} lines with minimal syntax fix applied]
+</CODE>
+<EXPLANATION>[What single change was made]</EXPLANATION>
 </FIX>
 
-RULES:
-1. Output ONLY ONE <FIX> tag
-2. Inside <CODE>, put raw fixed code (no backticks)
-3. Preserve original indentation unless it causes the error
+EXAMPLE:
+If line has: "class Foo {{" (missing closing brace)
+Fix to: "class Foo {{}}" (add closing brace)
+Return ALL lines, not just the changed one.
 """
         
         try:
@@ -788,11 +884,7 @@ void log_message(std::string msg) {{
     def _get_language(self, file_path: Path) -> str:
         """Determine language from file extension."""
         ext_map = {
-            '.py': 'python',
-            '.java': 'java',
-            '.cpp': 'cpp',
-            '.c': 'c',
-            '.h': 'cpp'  # Header files treated as C++ for syntax
+            '.py': 'python'
         }
         return ext_map.get(file_path.suffix, 'python')
     
@@ -906,3 +998,116 @@ void log_message(std::string msg) {{
         cleaned = '\n'.join(normalized_lines)
         
         return cleaned
+    def _identify_scope(self, lines: List[str], line_idx: int) -> Tuple[str, int, int]:
+        """
+        Identify if a line is inside a function, class, or global scope.
+        Returns (scope_type, start_line, end_line)
+        """
+        # Scan upwards for definitions
+        # This is a simplified heuristic mainly for Python/C++/Java style indentation
+        
+        current_indent = len(lines[line_idx]) - len(lines[line_idx].lstrip())
+        
+        func_start = -1
+        class_start = -1
+        
+        for i in range(line_idx, -1, -1):
+            line = lines[i]
+            if not line.strip(): continue
+            
+            indent = len(line) - len(line.lstrip())
+            stripped = line.strip()
+            
+            # Function detection
+            if indent < current_indent and (stripped.startswith('def ') or ' void ' in line or ' int ' in line):
+                 if func_start == -1:
+                     func_start = i
+            
+            # Class detection
+            if indent < current_indent and (stripped.startswith('class ') or 'class ' in line):
+                class_start = i
+                break # Found the enclosing class, stop
+        
+        # Determine scope hierarchy
+        if func_start != -1:
+            start, end = self._find_block_bounds(lines, func_start)
+            return ('function', start, end)
+        elif class_start != -1:
+            start, end = self._find_block_bounds(lines, class_start)
+            return ('class', start, end)
+        else:
+            return ('global', max(0, line_idx - 5), min(len(lines), line_idx + 6))
+
+    def _find_block_bounds(self, lines: List[str], start_idx: int) -> Tuple[int, int]:
+        """Given a start line (def/class), find where the indentation block ends."""
+        start_line = lines[start_idx]
+        base_indent = len(start_line) - len(start_line.lstrip())
+        
+        end_idx = len(lines)
+        for i in range(start_idx + 1, len(lines)):
+            line = lines[i]
+            if not line.strip(): continue
+            indent = len(line) - len(line.lstrip())
+            if indent <= base_indent:
+                end_idx = i
+                break
+        return start_idx, end_idx
+
+    def _generate_class_skeleton(self, lines: List[str], class_start: int, class_end: int) -> str:
+        """Create a skeleton of the class: keep vars, blank out function bodies."""
+        skeleton = []
+        
+        for i in range(class_start, class_end):
+            line = lines[i]
+            if not line.strip(): 
+                skeleton.append("")
+                continue
+                
+            indent = len(line) - len(line.lstrip())
+            stripped = line.strip()
+            
+            # Simple heuristic for method start
+            is_method = stripped.startswith('def ') or ('(' in line and ')' in line and ('{' in line or ':' in line))
+            
+            if is_method:
+                 skeleton.append(line + " ... }") # Simplified placeholder
+                 continue
+            
+            # Keep member variables / fields
+            if '=' in line or ';' in line:
+                skeleton.append(line)
+        
+        return '\n'.join(skeleton)
+
+    def _extract_smart_context(self, code: str, error_line: int) -> Dict:
+        """
+        Build rich context based on error location.
+        """
+        lines = code.split('\n')
+        
+        # 1. Identify Scope (Function vs Class vs Global)
+        scope_type, start, end = self._identify_scope(lines, error_line)
+        
+        # 2. Extract Focused Code (The part needing fix)
+        focused_lines = lines[start:end]
+        focused_code = '\n'.join(focused_lines)
+        
+        # 3. Extract Metadata (Imports / Globals)
+        metadata = self._extract_global_context(code)
+        
+        # 4. Extract Skeleton (Parent Context)
+        skeleton = ""
+        if scope_type == 'function':
+            # Find parent class to give skeleton
+            _, class_start, class_end = self._identify_scope(lines, start - 1)
+            if class_start != -1:
+                skeleton = self._generate_class_skeleton(lines, class_start, class_end)
+        
+        return {
+            'scope': scope_type,
+            'focused_code': focused_code,
+            'skeleton': skeleton,
+            'metadata': metadata,
+            'region_start': start + 1, # 1-indexed for display
+            'region_end': end
+        }

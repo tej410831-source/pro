@@ -11,13 +11,8 @@
 ✅ **LLM Semantic Analysis** - Logic errors, security issues  
 ✅ **Automatic Fix Generation** - Executable code patches  
 
-## Supported Languages
-
-- Python (.py) - via built-in `ast` module
-- Java (.java) - via tree-sitter
-- C++ (.cpp) - via tree-sitter
-- C (.c) - via tree-sitter
-- C/C++ Headers (.h) - via tree-sitter
+## 💻 Supported Languages
+- **Python** (`.py`)
 
 ## Installation
 
