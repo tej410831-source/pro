@@ -49,15 +49,8 @@ class SyntaxFixGenerator:
     ) -> Dict:
         """
         Suggest fixes for syntax errors sequentially, waiting for USER to apply them.
-        
-        Args:
-            file_path: Path to file
-            code: Original code
-            errors: List of FileSyntaxError objects
-        
-        Returns:
-            Dict with execution stats
         """
+        # Header is kept (as requested)
         print(f"\n🔍 Analysis for {file_path.name}: Found {len(errors)} error(s)")
         print(f"{'Line':<8} {'Error Type':<15} {'Message'}")
         print("─" * 70)
@@ -69,18 +62,9 @@ class SyntaxFixGenerator:
         fixes_presented = 0
         
         for idx, error in enumerate(errors, 1):
-            print(f"\n════════════════════════════════════════════════════════════")
-            print(f"🔴 Error {idx}/{len(errors)} at Line {error.line}")
-            print(f"   Message: {error.message}")
-            print(f"════════════════════════════════════════════════════════════")
-            print("⏳ Generating fix...")
+            print(f"⏳ Generating fix for Line {error.line}...")
             
             try:
-                # We pass 'code' here. Since user updates manually, 'code' might be stale 
-                # if we were tracking state, but for manual mode, we just use the original 
-                # or rely on the user having the file open. 
-                # Ideally, if the user saves between steps, we should reload, but 
-                # for simplicity, we use the loaded code context for the prompt.
                 fix_result = await self._fix_single_error(
                     code,
                     error,
@@ -95,20 +79,25 @@ class SyntaxFixGenerator:
                 fixed_code = fix_result['fixed_code']
                 explanation = fix_result.get('explanation', 'Fixed syntax error')
                 
-                print(f"\n💡 Suggested Fix (Lines {region['start_line']}-{region['end_line']}):")
-                print(f"   ℹ️  {explanation}\n")
-                print("👇 COPY THIS CODE 👇")
+                # Simplified Box Design
+                print(f"\n👉 REPLACE Lines {region['start_line']} - {region['end_line']} with:")
                 print("────────────────────────────────────────────────────────────")
                 print(fixed_code.rstrip())
                 print("────────────────────────────────────────────────────────────")
+                print(f"ℹ️  Wait: {explanation}")
                 
                 while True:
-                    choice = input(f"\n[User Action] Have you applied this fix? (y=next, q=quit file): ").strip().lower()
-                    if choice == 'y':
+                    # Clean, simple prompt
+                    choice = input(f"\n> Press Enter when pasted (or 's' to skip, 'q' to quit file): ").strip().lower()
+                    
+                    if choice == '': # User pressed Enter (Applied)
                         fixes_presented += 1
                         break
-                    elif choice == 'q':
-                        print("Skipping remaining errors for this file.")
+                    elif choice == 's': # Skip this error
+                        print("  Skipped.")
+                        break
+                    elif choice == 'q': # Quit file
+                        print("  Skipping remaining errors for this file.")
                         return {'success': True, 'fixes_presented': fixes_presented}
             
             except Exception as e:
