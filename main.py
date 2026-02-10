@@ -17,20 +17,27 @@ app = typer.Typer(help="Advanced Hybrid Static + AI Code Analysis System")
 console = Console()
 @app.command()
 def check_files(
-    folder: Path = typer.Argument(..., help="Folder to check file-by-file")
+    folder: Path = typer.Argument(..., help="Folder to check file-by-file"),
+    vllm_url: str = typer.Option("http://localhost:8000/v1", "--vllm-url", help="vLLM server URL"),
 ):
     """
     Check each file one-by-one for syntax correctness.
     """
     from core.scanner import FileScanner
     from analyzers.static_syntax import StaticSyntaxAnalyzer
+    from llm.vllm_client import VLLMClient
 
-    console.print("[bold cyan]🔍 File-by-file syntax check[/bold cyan]\n")
+    console.print(f"[bold cyan]🔍 File-by-file syntax check (LLM Enabled)[/bold cyan]")
+    
+    try:
+        llm_client = VLLMClient(base_url=vllm_url)
+    except:
+        llm_client = None
 
     scanner = FileScanner(folder)
     files = scanner.scan()
 
-    analyzer = StaticSyntaxAnalyzer()
+    analyzer = StaticSyntaxAnalyzer(llm_client)
 
     passed = 0
     failed = 0
@@ -38,7 +45,7 @@ def check_files(
     for idx, file_path in enumerate(files, 1):
         console.print(f"[yellow]{idx}/{len(files)} Checking:[/yellow] {file_path}")
 
-        is_valid, errors = analyzer.analyze_file(file_path)
+        is_valid, errors = asyncio.run(analyzer.analyze_file(file_path))
 
         if is_valid:
             console.print(f"  [green]✅ OK[/green]\n")
@@ -131,7 +138,7 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
     console.print(f"✓ Found {len(files)} code files\n")
     
     # Phase 2: Static Syntax Check (Scanning is universal, interaction is mode-specific)
-    syntax_analyzer = StaticSyntaxAnalyzer()
+    syntax_analyzer = StaticSyntaxAnalyzer(llm_client)
     syntax_fix_generator = SyntaxFixGenerator(llm_client)
     
     lang_map = {'.py': 'python'}
@@ -150,7 +157,7 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
     
     # Step 1: Scan all files first
     for file_path in files:
-        is_valid, errors = syntax_analyzer.analyze_file(file_path)
+        is_valid, errors = await syntax_analyzer.analyze_file(file_path)
         
         if not is_valid:
             error_files.append(file_path)
@@ -199,7 +206,7 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
                 # 🔄 Sequential Loop: Stay on this file until clean or user skips
                 while True:
                     # 1. Analyze the file (Fresh scan from disk)
-                    current_valid, current_errors = syntax_analyzer.analyze_file(file_path)
+                    current_valid, current_errors = await syntax_analyzer.analyze_file(file_path)
                     
                     if current_valid:
                         syntax_fixes[str(file_path)] = {

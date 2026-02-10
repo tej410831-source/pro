@@ -35,8 +35,8 @@ class StructuralAnalyzer:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     code = f.read()
                 
-                # Use pure Python parser
-                data = self.parser.parse_python(code, file_path)
+                # Use hybrid parser (Native AST for .py, Tree-sitter for others)
+                data = self.parser.parse(code, file_path)
                 self.raw_data[str(file_path)] = data
                 
                 module_name = file_path.stem

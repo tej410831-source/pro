@@ -88,9 +88,16 @@ class SyntaxFixGenerator:
                 
                 while True:
                     # Clean, simple prompt
-                    choice = input(f"\n> Press Enter when pasted (or 's' to skip, 'q' to quit file): ").strip().lower()
+                    choice = input(f"\n> Apply fix? [a]pply, [Enter] when pasted, [s]kip, [q]uit: ").strip().lower()
                     
-                    if choice == '': # User pressed Enter (Applied)
+                    if choice == 'a': # Auto-apply
+                        new_code = self.apply_patch_to_code(code, region, fixed_code)
+                        with open(file_path, 'w', encoding='utf-8') as f:
+                            f.write(new_code)
+                        print(f"  ✓ Applied and saved to {file_path.name}")
+                        fixes_presented += 1
+                        break
+                    elif choice == '': # User pressed Enter (Applied manually)
                         fixes_presented += 1
                         break
                     elif choice == 's': # Skip this error

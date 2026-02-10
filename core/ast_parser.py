@@ -1,23 +1,90 @@
 """
 Structural Parser
 Extracts symbols (functions, classes) and call sites from source code.
+Uses native AST for Python and Tree-sitter for C, C++, and Java.
 """
 
 import ast
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+import tree_sitter_languages
+from tree_sitter import Parser, Language, Query
 
 class StructuralParser:
-    """Extracts structural information from source files using AST."""
+    """Extracts structural information from source files using AST or Tree-sitter."""
 
     def __init__(self):
-        # Pure Python parser - no initialization needed
-        pass
+        self.parsers = {}
+        self.languages = {}
+        self.queries = {}
+        
+        # Initialize Tree-sitter for non-Python languages
+        for lang_id in ['c', 'cpp', 'java']:
+            try:
+                lang = tree_sitter_languages.get_language(lang_id)
+                parser = tree_sitter_languages.get_parser(lang_id)
+                self.languages[lang_id] = lang
+                self.parsers[lang_id] = parser
+                
+                # Pre-compile queries for performance
+                if lang_id == 'c':
+                    # Simplified C query
+                    query_str = """
+                    (function_definition
+                      declarator: (function_declarator
+                        declarator: (identifier) @name
+                        parameters: (parameter_list) @params)
+                    ) @func
+                    """
+                elif lang_id == 'cpp':
+                    query_str = """
+                    (function_definition
+                      declarator: (function_declarator) @func
+                    )
+                    
+                    (class_specifier
+                      name: (type_identifier) @name
+                    ) @class
+                    """
+                elif lang_id == 'java':
+                    query_str = """
+                    (method_declaration
+                      name: (identifier) @name
+                      parameters: (formal_parameters) @params
+                    ) @func
+                    
+                    (class_declaration
+                      name: (identifier) @name
+                    ) @class
+                    """
+                
+                self.queries[lang_id] = lang.query(query_str)
+            except Exception as e:
+                print(f"Warning: Failed to initialize Tree-sitter for {lang_id}: {e}")
 
-    def parse_python(self, code: str, file_path: Path) -> Dict[str, Any]:
-        """
-        Parse Python code and extract functions, classes, and calls.
-        """
+    def parse(self, code: str, file_path: Path) -> Dict[str, Any]:
+        """Unified entry point for parsing any supported file."""
+        ext = file_path.suffix.lower()
+        if ext == '.py':
+            return self._parse_python_ast(code, file_path)
+        
+        lang_map = {
+            '.c': 'c',
+            '.cpp': 'cpp',
+            '.cc': 'cpp',
+            '.h': 'c', # Headers can be C or CPP, default to C for simple extract
+            '.hpp': 'cpp',
+            '.java': 'java'
+        }
+        
+        lang_id = lang_map.get(ext)
+        if lang_id and lang_id in self.parsers:
+            return self._parse_with_treesitter(code, lang_id)
+        
+        return {"functions": [], "classes": [], "imports": [], "calls": []}
+
+    def _parse_python_ast(self, code: str, file_path: Path) -> Dict[str, Any]:
+        """Parse Python code using native AST module."""
         try:
             tree = ast.parse(code)
         except SyntaxError:
@@ -56,7 +123,6 @@ class StructuralParser:
                     "attributes": []
                 }
                 
-                # Simple attribute detection (assignments in class body)
                 for item in node.body:
                     if isinstance(item, ast.Assign):
                         for target in item.targets:
@@ -77,10 +143,8 @@ class StructuralParser:
                 args = [arg.arg for arg in node.args.args]
                 signature = f"{node.name}({', '.join(args)})"
                 
-                # Capture function body code
                 try:
-                    import ast as ast_mod # Use module level ast
-                    body_code = ast_mod.get_source_segment(self.source_code, node)
+                    body_code = ast.get_source_segment(self.source_code, node)
                 except:
                     body_code = ""
 
@@ -90,13 +154,12 @@ class StructuralParser:
                     "name": node.name,
                     "line": node.lineno,
                     "signature": signature,
-                    "body_code": body_code,
+                    "body_code": body_code or "",
                     "calls": self.calls_in_current,
                     "parent_class": self.current_class
                 }
                 self.functions.append(func_data)
                 
-                # Also add to class if within one
                 if self.current_class:
                     for c in self.classes:
                         if c["name"] == self.current_class:
@@ -106,7 +169,6 @@ class StructuralParser:
                 self.current_function = prev_func
                 self.calls_in_current = prev_calls
 
-            # Alias for async definitions
             visit_AsyncFunctionDef = visit_FunctionDef
 
             def visit_Call(self, node):
@@ -131,3 +193,88 @@ class StructuralParser:
             "imports": analyzer.imports,
             "calls": all_calls
         }
+
+    def _parse_with_treesitter(self, code: str, lang_id: str) -> Dict[str, Any]:
+        """Extract functions and classes using Tree-sitter queries."""
+        parser = self.parsers[lang_id]
+        query = self.queries.get(lang_id)
+        
+        # Helper to find nodes by field or type
+        def find_child_by_type(n, t):
+            for c in n.children:
+                if c.type == t: return c
+            return None
+
+        try:
+            tree = parser.parse(bytes(code, "utf8"))
+            root = tree.root_node
+        except Exception as e:
+            print(f"Error parsing with Tree-sitter ({lang_id}): {e}")
+            return {"functions": [], "classes": [], "imports": [], "calls": []}
+
+        results = {
+            "functions": [],
+            "classes": [],
+            "imports": [], # Placeholder for now
+            "calls": []    # Placeholder for calls extraction
+        }
+
+        if not query:
+            return results
+
+        captures = query.captures(root)
+        
+        # We need to track which node belongs to which class
+        # (Simplified: functions/methods following a class but before next class)
+        current_class = None
+
+        for node, tag in captures:
+            if tag == 'class':
+                current_class = node.child_by_field_name('name').text.decode('utf8')
+                results["classes"].append({
+                    "name": current_class,
+                    "line": node.start_point[0] + 1,
+                    "methods": [],
+                    "attributes": []
+                })
+            
+            elif tag == 'func':
+                # Helper to recursive find name
+                def get_symbol_name(n):
+                    if n.type in ['identifier', 'type_identifier', 'field_identifier', 'destructor_name']:
+                        return n.text.decode('utf8')
+                    # Scoped identifiers (A::B)
+                    if n.type == 'scoped_identifier':
+                        return n.text.decode('utf8')
+                    for c in n.children:
+                        res = get_symbol_name(c)
+                        if res: return res
+                    return None
+
+                name = get_symbol_name(node) or "unknown"
+                
+                # Signature extraction (simplified)
+                sig_parts = []
+                for child in node.children:
+                    if child.type in ['formal_parameters', 'parameter_list', 'function_declarator']:
+                        # For function_declarator, we want its params
+                        params = find_child_by_type(child, 'parameter_list') or find_child_by_type(child, 'formal_parameters')
+                        if params:
+                            sig_parts.append(params.text.decode('utf8'))
+                            break
+                
+                signature = f"{name}{sig_parts[0] if sig_parts else '()'}"
+                
+                results["functions"].append({
+                    "name": name,
+                    "line": node.start_point[0] + 1,
+                    "signature": signature,
+                    "body_code": code[node.start_byte:node.end_byte],
+                    "calls": [],
+                    "parent_class": current_class
+                })
+                
+                if current_class:
+                    results["classes"][-1]["methods"].append(name)
+
+        return results
