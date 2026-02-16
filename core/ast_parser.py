@@ -240,7 +240,6 @@ class StructuralParser:
         current_class = None
 
         for node, tag in captures:
-            print(f"DEBUG CAPTURE: {tag} ({node.type})")
             if tag == 'class':
                 current_class = node.child_by_field_name('name').text.decode('utf8')
                 results["classes"].append({

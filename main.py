@@ -232,6 +232,7 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
                 "imports": data.get("imports", [])
             }
             
+        dead_code_symbols = dead_code_data.get("functions", []) + dead_code_data.get("variables", [])
         console.print(f"✓ Symbol table built ({len(symbol_table.symbols)} symbols indexed)\n")
     
     # Only show structural analysis results for 'structural' or 'full' modes
@@ -266,7 +267,8 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
         print(f"UNUSED FUNCTIONS/METHODS ({len(unused_funcs)})")
         print(f"{'='*70}")
         for symbol in unused_funcs[:20]:
-            print(f"  [{symbol.language if hasattr(symbol, 'language') else 'unknown'}] {symbol.name} at {symbol.file}:{symbol.line}")
+            lang = symbol.file.suffix.lstrip('.')
+            print(f"  [{lang}] {symbol.name} at {symbol.file}:{symbol.line}")
         if len(unused_funcs) > 20:
             print(f"  ... and {len(unused_funcs) - 20} more")
         
@@ -275,7 +277,8 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
         print(f"UNUSED VARIABLES ({len(unused_vars)})")
         print(f"{'='*70}")
         for symbol in unused_vars[:20]:
-            print(f"  [{symbol.language if hasattr(symbol, 'language') else 'unknown'}] {symbol.name} at {symbol.file}:{symbol.line}")
+            lang = symbol.file.suffix.lstrip('.')
+            print(f"  [{lang}] {symbol.name} at {symbol.file}:{symbol.line}")
         if len(unused_vars) > 20:
             print(f"  ... and {len(unused_vars) - 20} more")
         
@@ -839,7 +842,7 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
         "bugs": bugs,
         "fixes": fixes,
         "cross_file_analysis": {
-            "circular_dependencies": [[str(f) for f in cycle] for cycle in circular_deps],
+            "circular_dependencies": circular_deps,
             "dead_code": [
                 {"file": str(s.file), "name": s.name, "line": s.line}
                 for s in dead_code_symbols
