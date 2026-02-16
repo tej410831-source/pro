@@ -102,6 +102,7 @@ class StructuralAnalyzer:
                 caller_qname = f"{mod_name}.{caller_prefix}{func_data['name']}"
                 
                 for f_call in func_data.get("calls", []):
+                    called_names.add(f_call)
                     # Resolve call to likely targets (simplified)
                     targets = self.symbol_table.find_symbols_by_name(f_call)
                     for target in targets:

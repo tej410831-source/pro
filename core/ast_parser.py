@@ -221,13 +221,15 @@ class StructuralParser:
             root = tree.root_node
         except Exception as e:
             print(f"Error parsing with Tree-sitter ({lang_id}): {e}")
-            return {"functions": [], "classes": [], "imports": [], "calls": []}
+            return {"functions": [], "classes": [], "imports": [], "calls": [], "identifiers": [], "global_vars": []}
 
         results = {
             "functions": [],
             "classes": [],
-            "imports": [], # Placeholder for now
-            "calls": []    # Placeholder for calls extraction
+            "imports": [],
+            "calls": [],
+            "identifiers": [],
+            "global_vars": []
         }
 
         if not query:
@@ -262,7 +264,12 @@ class StructuralParser:
                         if res: return res
                     return None
 
-                name = get_symbol_name(node) or "unknown"
+                # Favor direct field 'name' if parser provided it
+                name_node = node.child_by_field_name('name')
+                if name_node:
+                    name = name_node.text.decode('utf8')
+                else:
+                    name = get_symbol_name(node) or "unknown"
                 
                 
                 # Signature extraction — include return type

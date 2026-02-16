@@ -266,21 +266,17 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
         print(f"\n{'='*70}")
         print(f"UNUSED FUNCTIONS/METHODS ({len(unused_funcs)})")
         print(f"{'='*70}")
-        for symbol in unused_funcs[:20]:
+        for symbol in unused_funcs:
             lang = symbol.file.suffix.lstrip('.')
             print(f"  [{lang}] {symbol.name} at {symbol.file}:{symbol.line}")
-        if len(unused_funcs) > 20:
-            print(f"  ... and {len(unused_funcs) - 20} more")
         
         # Unused Variables
         print(f"\n{'='*70}")
         print(f"UNUSED VARIABLES ({len(unused_vars)})")
         print(f"{'='*70}")
-        for symbol in unused_vars[:20]:
+        for symbol in unused_vars:
             lang = symbol.file.suffix.lstrip('.')
             print(f"  [{lang}] {symbol.name} at {symbol.file}:{symbol.line}")
-        if len(unused_vars) > 20:
-            print(f"  ... and {len(unused_vars) - 20} more")
         
         # Import Cycles
         print(f"\n{'='*70}")
