@@ -2,9 +2,9 @@ from core.ast_parser import StructuralParser
 from pathlib import Path
 import json
 
+import sys
 parser = StructuralParser()
-# Test C file if SemanticBugs.java is tedious? Or check SemanticBugs.java again.
-file_path = Path("multilang_test/SemanticBugs.java")
+file_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("multilang_test/SemanticBugs.java")
 
 with open(file_path, 'r', encoding='utf-8') as f:
     code = f.read()
