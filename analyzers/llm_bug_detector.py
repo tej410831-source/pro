@@ -84,32 +84,38 @@ class LLMBugDetector:
             if global_vars:
                 ctx_section += f"Global Variables:\n{global_vars}\n"
         
-        # Class context
+        # Code Section: Use Class Context if available (it includes the target body), else use raw code
         if class_ctx:
-            ctx_section += f"\n**Class Context (Skeleton):**\n```{lang}\n{class_ctx}\n```\n"
+            code_block = f"\n**Class Context (Skeleton):**\n```{lang}\n{class_ctx}\n```\n"
+        else:
+            code_block = f"\n**Target Code:**\n```{lang}\n{code}\n```\n"
         
-        # Cross-file dependencies
+        # Call Graph (Dependencies)
+        dep_section = ""
         if dep_hints:
-            ctx_section += f"\n**External Dependency Hints:**\n{dep_hints}\n"
+            dep_section = f"{dep_hints}\n"
 
         return f"""You are a senior {lang} code auditor.
-Analyze the target code block below and identify ONLY concrete, actionable bugs.
+Analyze the target code block below and identify ONLY CRITICAL, FUNCTION-BREAKING bugs.
 
 **Target File:** {file}
 **Target Symbol:** {name}
 {ctx_section}
-**Target Code:**
-```{lang}
-{code}
-```
+{code_block}
+{dep_section}
 
 **Focus on:**
-1. Potential crashes, runtime errors, or logic flaws.
-2. Cross-file inconsistencies (use the Dependency Hints provided).
-3. Security vulnerabilities.
-4. Type mismatches between function calls and signatures.
+1. DEFINITE crashes (segfaults, exceptions, null pointers).
+2. LOGIC ERRORS that break the core functionality.
+3. CRITICAL security vulnerabilities (e.g. buffer overflows, SQL injection).
+4. DATA CORRUPTION or invalid state.
 
-**Ignore:** Style, formatting, or minor optimizations.
+**Do NOT Report:**
+1. Style, formatting, or consistent naming issues.
+2. Minor performance optimizations.
+3. Best practices that don't cause bugs.
+4. Theoretical issues that are unlikely to occur in practice.
+5. Missing documentation.
 
 Respond with a JSON object:
 {{

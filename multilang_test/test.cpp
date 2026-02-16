@@ -2,8 +2,8 @@
 
 class TestClass {
 public:
-    void sayHello() {
-        std::cout << "Hello World" << std::endl; // Added semicolon
+    void sayHello(){
+        std::cout << "Hello World" << std::endl;
     }
 };
 

@@ -17,6 +17,7 @@ class StructuralParser:
         self.parsers = {}
         self.languages = {}
         self.queries = {}
+        self.queries_usage = {}
         
         # Initialize Tree-sitter for non-Python languages
         for lang_id in ['c', 'cpp', 'java']:
@@ -35,6 +36,8 @@ class StructuralParser:
                         declarator: (identifier) @name
                         parameters: (parameter_list) @params)
                     ) @func
+                    
+                    (declaration) @var
                     """
                 elif lang_id == 'cpp':
                     query_str = """
@@ -45,6 +48,9 @@ class StructuralParser:
                     (class_specifier
                       name: (type_identifier) @name
                     ) @class
+                    
+                    (declaration) @var
+                    (field_declaration) @var
                     """
                 elif lang_id == 'java':
                     query_str = """
@@ -56,9 +62,13 @@ class StructuralParser:
                     (class_declaration
                       name: (identifier) @name
                     ) @class
+                    
+                    (declaration) @var
+                    (field_declaration) @var
                     """
                 
                 self.queries[lang_id] = lang.query(query_str)
+                self.queries_usage[lang_id] = lang.query("(identifier) @id")
             except Exception as e:
                 print(f"Warning: Failed to initialize Tree-sitter for {lang_id}: {e}")
 
@@ -198,6 +208,7 @@ class StructuralParser:
         """Extract functions and classes using Tree-sitter queries."""
         parser = self.parsers[lang_id]
         query = self.queries.get(lang_id)
+        usage_query = self.queries_usage.get(lang_id)
         
         # Helper to find nodes by field or type
         def find_child_by_type(n, t):
@@ -229,6 +240,7 @@ class StructuralParser:
         current_class = None
 
         for node, tag in captures:
+            print(f"DEBUG CAPTURE: {tag} ({node.type})")
             if tag == 'class':
                 current_class = node.child_by_field_name('name').text.decode('utf8')
                 results["classes"].append({
@@ -253,17 +265,26 @@ class StructuralParser:
 
                 name = get_symbol_name(node) or "unknown"
                 
-                # Signature extraction (simplified)
+                
+                # Signature extraction — include return type
+                return_type = ""
                 sig_parts = []
                 for child in node.children:
-                    if child.type in ['formal_parameters', 'parameter_list', 'function_declarator']:
+                    # Return type (comes before the function name/declarator)
+                    if child.type in ['primitive_type', 'type_identifier', 'sized_type_specifier',
+                                      'template_type', 'scoped_type_identifier', 'auto']:
+                        return_type = child.text.decode('utf8')
+                    elif child.type == 'type':  # Java return type wrapper
+                        return_type = child.text.decode('utf8')
+                    elif child.type in ['formal_parameters', 'parameter_list', 'function_declarator']:
                         # For function_declarator, we want its params
                         params = find_child_by_type(child, 'parameter_list') or find_child_by_type(child, 'formal_parameters')
                         if params:
                             sig_parts.append(params.text.decode('utf8'))
                             break
                 
-                signature = f"{name}{sig_parts[0] if sig_parts else '()'}"
+                params_str = sig_parts[0] if sig_parts else '()'
+                signature = f"{return_type + ' ' if return_type else ''}{name}{params_str}"
                 
                 results["functions"].append({
                     "name": name,
@@ -276,5 +297,80 @@ class StructuralParser:
                 
                 if current_class:
                     results["classes"][-1]["methods"].append(name)
+
+        # ── Tree-sitter: Extract imports, globals, and call sites ──
+        
+        # 1. Walk root children for imports and global declarations
+        for child in root.children:
+            # Imports / includes
+            if child.type == 'preproc_include':  # C/C++ #include
+                results["imports"].append({
+                    "module": child.text.decode('utf8').strip(),
+                    "names": []
+                })
+            elif child.type == 'import_declaration':  # Java import
+                results["imports"].append({
+                    "module": child.text.decode('utf8').strip(),
+                    "names": []
+                })
+            elif child.type == 'using_declaration':  # C++ using
+                results["imports"].append({
+                    "module": child.text.decode('utf8').strip(),
+                    "names": []
+                })
+            elif child.type == 'package_declaration':  # Java package
+                results["imports"].append({
+                    "module": child.text.decode('utf8').strip(),
+                    "names": []
+                })
+            
+            # Global declarations (#define, top-level variables)
+            elif child.type == 'preproc_def':  # #define
+                if "global_vars" not in results:
+                    results["global_vars"] = []
+                results["global_vars"].append(child.text.decode('utf8').strip())
+            elif child.type == 'declaration' and child.parent == root:  # top-level var/const
+                if "global_vars" not in results:
+                    results["global_vars"] = []
+                results["global_vars"].append(child.text.decode('utf8').strip())
+        
+        # 2. Extract call sites from each function body
+        def extract_calls(node):
+            """Recursively find call_expression nodes."""
+            calls = []
+            if node.type == 'call_expression':
+                func_node = node.child_by_field_name('function')
+                if func_node:
+                    call_name = func_node.text.decode('utf8')
+                    # Simplify: take last part of dotted names (e.g. System.out.println -> println)
+                    if '.' in call_name:
+                        call_name = call_name.split('.')[-1]
+                    if '::' in call_name:
+                        call_name = call_name.split('::')[-1]
+                    calls.append(call_name)
+            elif node.type == 'method_invocation': # Java specific
+                name_node = node.child_by_field_name('name')
+                if name_node:
+                    calls.append(name_node.text.decode('utf8'))
+            for child in node.children:
+                calls.extend(extract_calls(child))
+            return calls
+        
+        for func in results["functions"]:
+            # Re-parse the function body to find call sites
+            func_line = func["line"] - 1  # 0-indexed
+            for node, tag in captures:
+                if tag == 'func' and node.start_point[0] == func_line:
+                    func["calls"] = extract_calls(node)
+                    break
+
+        if usage_query:
+            captures_usage = usage_query.captures(root)
+            for node, tag in captures_usage:
+                if tag == 'id':
+                    try:
+                        name = node.text.decode('utf8')
+                        results["identifiers"].append(name)
+                    except: pass
 
         return results

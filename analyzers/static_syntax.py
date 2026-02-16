@@ -1,12 +1,20 @@
 """
-Static Syntax Analyzer (Python Only + LLM for others)
-Deterministic, compiler-grade syntax checking using Python's native AST for Python.
-LLM-based syntax checking for C/C++/Java (experimental).
+Static Syntax Analyzer
+Deterministic syntax checking:
+  - Python: native ast.parse()
+  - C/C++/Java: Tree-sitter ERROR node detection
 """
 
 import ast
 from pathlib import Path
 from typing import List, Tuple
+
+try:
+    import tree_sitter_languages
+    from tree_sitter import Parser
+    TREESITTER_AVAILABLE = True
+except ImportError:
+    TREESITTER_AVAILABLE = False
 
 class FileSyntaxError:
     def __init__(self, message: str = "", parser: str = "unknown", line: int = 0, column: int = 0):
@@ -19,7 +27,7 @@ class FileSyntaxError:
         self.severity = "critical"
 
 class StaticSyntaxAnalyzer:
-    """Analyze source files for syntax errors using native AST (Python) or LLM (C/C++/Java)."""
+    """Analyze source files for syntax errors using native AST (Python) or Tree-sitter (C/C++/Java)."""
     
     def __init__(self, llm_client=None):
         self.llm_client = llm_client
@@ -28,54 +36,62 @@ class StaticSyntaxAnalyzer:
             '.c': 'c',
             '.cpp': 'cpp',
             '.cc': 'cpp',
-            '.h': 'cpp', # Treat headers as CPP for now
+            '.h': 'cpp',
             '.hpp': 'cpp',
             '.java': 'java'
         }
+        
+        # Initialize Tree-sitter parsers for C/C++/Java
+        self.ts_parsers = {}
+        if TREESITTER_AVAILABLE:
+            for lang_id in ['c', 'cpp', 'java']:
+                try:
+                    parser = tree_sitter_languages.get_parser(lang_id)
+                    self.ts_parsers[lang_id] = parser
+                except Exception:
+                    pass  # Language grammar not available
     
-    async def analyze_file(self, file_path: Path) -> Tuple[bool, List[FileSyntaxError]]:
+    def analyze_file(self, file_path: Path) -> Tuple[bool, List[FileSyntaxError]]:
         """
         Analyze a file for syntax errors.
+        Now fully synchronous — no LLM calls needed for detection.
         """
         if not file_path.exists():
              return False, [FileSyntaxError(f"File not found: {file_path}", "os-error")]
 
         ext = file_path.suffix.lower()
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                source = f.read()
+        except Exception as e:
+            return False, [FileSyntaxError(f"Read error: {str(e)}", "io-error")]
+        
         if ext == '.py':
-            # Deterministic Python check
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    source = f.read()
-                return self._check_python_code(source)
-            except Exception as e:
-                return False, [FileSyntaxError(f"Read error: {str(e)}", "python-io")]
+            return self._check_python_code(source)
         
         elif ext in self.lang_map:
-            # LLM-based check for C/C++/Java
-            if not self.llm_client:
-                 # If no LLM, we can't check syntax for these languages
-                 return True, [] 
-            
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    source = f.read()
-                language = self.lang_map[ext]
-                return await self._check_syntax_with_llm(source, language, file_path.name)
-            except Exception as e:
-                 return False, [FileSyntaxError(f"Analysis error: {str(e)}", f"{language}-llm")]
+            language = self.lang_map[ext]
+            if language in self.ts_parsers:
+                return self._check_treesitter_syntax(source, language)
+            else:
+                # Tree-sitter not available for this language
+                return True, []
         
         else:
-            # Unsupported type
             return True, []
 
     def analyze_code(self, code: str, extension: str) -> Tuple[bool, List[FileSyntaxError]]:
         """
-        Analyze code string directly. (Synchronous wrapper for Python only)
-        For async LLM check, use analyze_file or a new async method.
-        This legacy method is kept for Python compatibility.
+        Analyze code string directly (synchronous).
         """
         if extension == '.py':
             return self._check_python_code(code)
+        
+        lang = self.lang_map.get(extension)
+        if lang and lang in self.ts_parsers:
+            return self._check_treesitter_syntax(code, lang)
+        
         return True, []
     
     def _check_python_code(self, source: str) -> Tuple[bool, List[FileSyntaxError]]:
@@ -100,57 +116,59 @@ class StaticSyntaxAnalyzer:
             )
             return False, [error]
 
-    async def _check_syntax_with_llm(self, code: str, language: str, filename: str) -> Tuple[bool, List[FileSyntaxError]]:
+    def _check_treesitter_syntax(self, source: str, language: str) -> Tuple[bool, List[FileSyntaxError]]:
         """
-        Ask vLLM to find syntax errors.
+        Check C/C++/Java code using Tree-sitter.
+        Walks the parse tree for ERROR and MISSING nodes.
+        Deduplicates nested errors (if parent is ERROR, skip children).
         """
-        from utils.llm_utils import robust_json_load
+        parser = self.ts_parsers[language]
+        tree = parser.parse(bytes(source, 'utf-8'))
         
-        prompt = f"""You are a {language} compiler.
-Check the following code for SYNTAX ERRORS only.
-Ignore logical errors or warnings. Focus on missing semicolons, unmatched braces, invalid types, etc.
-
-File: {filename}
-```{language}
-{code}
-```
-
-If there are syntax errors, list them in JSON.
-If the code is syntactically valid, return an empty list.
-
-Refrain from reporting "missing main function" or "dependency not found" logic.
-Only report parsing errors that would prevent compilation of this single file unit.
-
-Respond with JSON:
-{{
-  "errors": [
-    {{
-      "line": <number>,
-      "column": <number>,
-      "message": "<short error message>"
-    }}
-  ]
-}}"""
-
-        try:
-            response = await self.llm_client.generate_completion(prompt, temperature=0.1)
-            data = robust_json_load(response)
+        source_lines = source.splitlines()
+        errors = []
+        
+        def walk(node, parent_is_error=False):
+            is_error = node.type == 'ERROR'
+            is_missing = node.is_missing
             
-            if not data or "errors" not in data:
-                return True, []
-            
-            errors = []
-            for e in data["errors"]:
+            if (is_error or is_missing) and not parent_is_error:
+                line = node.start_point[0] + 1
+                col = node.start_point[1] + 1
+                end_line = node.end_point[0] + 1
+                
+                # Build a descriptive error message
+                if is_missing:
+                    msg = f"Missing expected token: '{node.type}'"
+                else:
+                    # Get the problematic text (truncated)
+                    try:
+                        text = node.text.decode('utf-8', errors='replace')[:50]
+                        if len(text) > 40:
+                            text = text[:40] + "..."
+                    except:
+                        text = ""
+                    
+                    # Get the source line for context
+                    if 0 < line <= len(source_lines):
+                        src_line = source_lines[line - 1].strip()
+                        msg = f"Syntax error near: '{src_line[:60]}'"
+                    elif text:
+                        msg = f"Unexpected syntax: '{text}'"
+                    else:
+                        msg = "Syntax error"
+                
                 errors.append(FileSyntaxError(
-                    line=e.get("line", 0),
-                    column=e.get("column", 0),
-                    message=e.get("message", "Syntax Error"),
-                    parser=f"{language}-llm"
+                    message=msg,
+                    parser=f"{language}-treesitter",
+                    line=line,
+                    column=col
                 ))
             
-            return (len(errors) == 0), errors
-            
-        except Exception as e:
-            # Fallback if LLM fails
-            print(f"LLM Syntax Check failed: {e}")
-            return True, []
+            # Walk children — skip children of ERROR nodes to avoid duplicates
+            for child in node.children:
+                walk(child, parent_is_error=(is_error or parent_is_error))
+        
+        walk(tree.root_node)
+        return (len(errors) == 0), errors
+

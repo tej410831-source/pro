@@ -4,6 +4,7 @@ Advanced Code Analyzer - Main CLI
 
 import typer
 import asyncio
+import os
 from pathlib import Path
 from rich.console import Console, Group
 from rich.table import Table
@@ -12,66 +13,22 @@ from rich.syntax import Syntax
 from rich.markdown import Markdown
 import json
 import difflib
+import warnings
+import time
+
+# Suppress Tree-sitter deprecation warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="tree_sitter")
 
 app = typer.Typer(help="Advanced Hybrid Static + AI Code Analysis System")
 console = Console()
-@app.command()
-def check_files(
-    folder: Path = typer.Argument(..., help="Folder to check file-by-file"),
-    vllm_url: str = typer.Option("http://localhost:8000/v1", "--vllm-url", help="vLLM server URL"),
-):
-    """
-    Check each file one-by-one for syntax correctness.
-    """
-    from core.scanner import FileScanner
-    from analyzers.static_syntax import StaticSyntaxAnalyzer
-    from llm.vllm_client import VLLMClient
-
-    console.print(f"[bold cyan]🔍 File-by-file syntax check (LLM Enabled)[/bold cyan]")
-    
-    try:
-        llm_client = VLLMClient(base_url=vllm_url)
-    except:
-        llm_client = None
-
-    scanner = FileScanner(folder)
-    files = scanner.scan()
-
-    analyzer = StaticSyntaxAnalyzer(llm_client)
-
-    passed = 0
-    failed = 0
-
-    for idx, file_path in enumerate(files, 1):
-        console.print(f"[yellow]{idx}/{len(files)} Checking:[/yellow] {file_path}")
-
-        is_valid, errors = asyncio.run(analyzer.analyze_file(file_path))
-
-        if is_valid:
-            console.print(f"  [green]✅ OK[/green]\n")
-            passed += 1
-        else:
-            console.print(f"  [red]❌ FAILED[/red]")
-            for e in errors:
-                console.print(
-                    f"    Line {e.line}, Col {e.column}: {e.message} "
-                    f"[{e.parser}]"
-                )
-            console.print()
-            failed += 1
-
-    console.print(
-        f"[bold green]✔ Passed:[/bold green] {passed}  "
-        f"[bold red]✖ Failed:[/bold red] {failed}"
-    )
 
 @app.command()
 def analyze(
     folder: Path = typer.Argument(..., help="Folder to analyze"),
     output: Path = typer.Option("report.json", "--output", "-o", help="Output report path"),
-    vllm_url: str = typer.Option("http://localhost:8000/v1", "--vllm-url", help="vLLM server URL"),
+    vllm_url: str = typer.Option("http://127.0.0.1:1234/v1", "--vllm-url", help="LLM server URL (OpenAI-compatible)"),
     generate_fixes: bool = typer.Option(True, "--fixes/--no-fixes", "--generate-fixes", help="Generate code fixes"),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Display raw LLM prompts"),
+
 ):
     """
     Analyze code folder with interactive task selection.
@@ -113,9 +70,9 @@ def analyze(
     console.print(f"\n[bold blue]🔍 Starting {analysis_mode.upper()} Analysis:[/bold blue] {folder}\n")
     
     # Run async analysis
-    asyncio.run(run_analysis(folder, output, vllm_url, generate_fixes, analysis_mode, verbose))
+    asyncio.run(run_analysis(folder, output, vllm_url, generate_fixes, analysis_mode))
 
-async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes: bool, analysis_mode: str = "full", verbose: bool = False):
+async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes: bool, analysis_mode: str = "full"):
     from core.scanner import FileScanner
     from analyzers.static_syntax import StaticSyntaxAnalyzer, FileSyntaxError
     from analyzers.syntax_fix_generator import SyntaxFixGenerator
@@ -124,11 +81,12 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
     from analyzers.cross_file_redundancy import CrossFileRedundancyDetector
     from core.symbol_table import SymbolTableBuilder, Symbol, SymbolType
     from core.call_graph_builder import CallGraphBuilder
+    from analyzers.structural_analyzer import StructuralAnalyzer
     from llm.vllm_client import VLLMClient
     from utils.html_report_generator import HTMLReportGenerator
     
     # Initialize vLLM client
-    console.print(f"[cyan]→ Connecting to vLLM at {vllm_url}[/cyan]")
+    console.print(f"[cyan]→ Connecting to LLM at {vllm_url}[/cyan]")
     llm_client = VLLMClient(base_url=vllm_url)
     
     # Scan files
@@ -137,158 +95,131 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
     files = scanner.scan()
     console.print(f"✓ Found {len(files)} code files\n")
     
-    # Phase 2: Static Syntax Check (Scanning is universal, interaction is mode-specific)
+    # Phase 2: Static Syntax Check
     syntax_analyzer = StaticSyntaxAnalyzer(llm_client)
     syntax_fix_generator = SyntaxFixGenerator(llm_client)
     
-    lang_map = {'.py': 'python'}
-    
-    if analysis_mode in ['full', 'syntax']:
-        console.print("Static syntax analysis (scanning all files)...")
-    
     # Results containers
     valid_files = []
-    error_files = [] # Files with syntax errors
     syntax_errors = {}
-    syntax_fixes = {}
     applied_fixes = {}
     bugs = []
     fixes = []
+    lang_map = {'.py': 'python', '.c': 'c', '.cpp': 'cpp', '.h': 'c', '.java': 'java'}
     
-    # Step 1: Scan all files first
-    for file_path in files:
-        is_valid, errors = await syntax_analyzer.analyze_file(file_path)
-        
-        if not is_valid:
-            error_files.append(file_path)
-            # Store original errors
+    # ── File-by-File Syntax Flow ──────────────────────────────
+    if analysis_mode in ['full', 'syntax']:
+        for idx, file_path in enumerate(files, 1):
+            # 1. DETECT — scan this file
+            is_valid, errors = syntax_analyzer.analyze_file(file_path)
+            
+            if is_valid:
+                valid_files.append(file_path)
+                console.print(f"  [green]✅ {idx}/{len(files)} {file_path.name}[/green]")
+                continue
+            
+            # ── This file has errors → clear screen and focus on it ──
+            os.system('cls' if os.name == 'nt' else 'clear')
+            
+            # Store errors for the report
             syntax_errors[str(file_path)] = [
-                {
-                    "severity": getattr(e, 'severity', 'error'),
-                    "line": e.line,
-                    "column": e.column,
-                    "message": e.message,
-                    "parser": e.parser
-                }
+                {"line": e.line, "column": e.column, "message": e.message, "parser": e.parser}
                 for e in errors
             ]
-        else:
-            valid_files.append(file_path)
-
-    # Step 2: Show ALL errors at once (UI Only)
-    if syntax_errors and analysis_mode in ['full', 'syntax']:
-        error_blocks = []
-        for file_path_str, errors in syntax_errors.items():
-            fname = Path(file_path_str).name
-            err_text = "\n".join([f"  • [bold red]Line {e['line']}:[/bold red] {e['message']}" for e in errors])
-            error_blocks.append(f"### {fname}\n{err_text}")
+            
+            # 2. SHOW — display errors with code snippet
+            console.print(Panel(
+                f"[bold]{file_path.name}[/bold]  ({idx}/{len(files)})",
+                title="[bold red]SYNTAX ERRORS[/bold red]",
+                border_style="red",
+                expand=False
+            ))
+            
+            for err in errors:
+                console.print(f"  [red]Line {err.line}, Col {err.column}:[/red] {err.message} [{err.parser}]")
+            console.print()
+            
+            # 3. FIXING LOOP — if fixes are enabled
+            if not generate_fixes:
+                console.print("[yellow]Fixes disabled (--no-fixes). Skipping.[/yellow]\n")
+                continue
+            
+            # Interactive fix loop: stay on this file until clean or user skips
+            while True:
+                # Re-read and re-parse from disk
+                current_valid, current_errors = syntax_analyzer.analyze_file(file_path)
+                
+                if current_valid:
+                    applied_fixes[str(file_path)] = True
+                    valid_files.append(file_path)
+                    console.print(f"\n  [bold green]✅ {file_path.name} — all syntax errors fixed![/bold green]\n")
+                    input("  Press Enter to continue to the next file...")
+                    break
+                
+                # Read current code
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    current_code = f.read()
+                
+                # 4. SUGGEST — LLM generates fix (shown as suggestion)
+                fix_result = await syntax_fix_generator.fix_file_manual_assist(
+                    file_path,
+                    current_code,
+                    current_errors
+                )
+                
+                fixes_made = fix_result.get('fixes_presented', 0)
+                
+                if fixes_made > 0:
+                    # 5. VERIFY — re-parse after user edits
+                    console.print(f"\n  [cyan]🔄 Re-checking {file_path.name}...[/cyan]")
+                else:
+                    console.print(f"\n  [yellow]⏩ Skipping {file_path.name}.[/yellow]\n")
+                    break
         
-        global_error_panel = Panel(
-            Markdown("\n\n---\n\n".join(error_blocks)),
-            title=f"[bold red]PROJECT SYNTAX ERRORS ({len(syntax_errors)} files)[/bold red]",
-            border_style="red"
-        )
-        console.print(global_error_panel)
-        console.print(f"\n[bold yellow]Found {len(syntax_errors)} files with errors. Starting interactive fixing...[/bold yellow]\n")
-
-    # Step 3: Interactive Fixing Loop
-    if generate_fixes and error_files:
-        for file_path in error_files:
-            file_path_str = str(file_path)
-            errors_data = syntax_errors[file_path_str]
-            # Convert back to FileSyntaxError objects for the generator
-            errors = [FileSyntaxError(e['message'], e['parser'], e['line'], e['column']) for e in errors_data]
-            language = lang_map.get(file_path.suffix, 'python')
-            
-            console.print(f"🔧 [bold]Interactive Fix for {file_path.name}:[/bold]")
-            
-            try:
-                # 🔄 Sequential Loop: Stay on this file until clean or user skips
-                while True:
-                    # 1. Analyze the file (Fresh scan from disk)
-                    current_valid, current_errors = await syntax_analyzer.analyze_file(file_path)
-                    
-                    if current_valid:
-                        syntax_fixes[str(file_path)] = {
-                            "original_code": "Modified", # simplified tracking
-                            "fixed_code": "Manual Update",
-                            "fixes_total": 0,
-                            "fixes_accepted": 1 # Just to mark as done
-                        }
-                        applied_fixes[str(file_path)] = True
-                        valid_files.append(file_path)
-                        console.print(f"  [green]✅ File {file_path.name} is now syntax-error free![/green]\n")
-                        break # Move to next file
-
-                    # 2. Show error status
-                    console.print(f"  [yellow]⚠️  File has {len(current_errors)} error(s).[/yellow]")
-                    for err in current_errors:
-                        console.print(f"    - Line {err.line}: {err.message}")
-                    
-                    # 3. Read current code for context
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        original_code = f.read()
-
-                    # 4. Trigger Manual Assist (One error at a time)
-                    fix_result = await syntax_fix_generator.fix_file_manual_assist(
-                        file_path,
-                        original_code,
-                        current_errors
-                    )
-                    
-                    # 5. Check if we should loop or break
-                    fixes_made = fix_result.get('fixes_presented', 0)
-                    
-                    if fixes_made > 0:
-                        console.print(f"\n  [yellow]🔄 Fix applied. Re-analyzing file...[/yellow]")
-                        # Loop continues to re-check the file
-                    else:
-                        console.print(f"\n  [yellow]⏩ Skipping remaining errors for this file.[/yellow]\n")
-                        break # User quit, move to next file
-
-            except Exception as e:
-                console.print(f"  [red]✗ Exceptional error during fix: {e}[/red]\n")
-    
-    elif not generate_fixes and syntax_errors:
-        console.print("[yellow]Note: --generate-fixes not enabled. Skipping interactive repairs.[/yellow]")
-    
-    if analysis_mode in ['full', 'syntax']:
-        console.print(f"\n✓ {len(valid_files)}/{len(files)} files passed syntax check")
+        # Summary
+        console.print(f"\n{'─'*50}")
+        console.print(f"  [bold]Syntax Check Summary[/bold]")
+        console.print(f"  ✓ {len(valid_files)}/{len(files)} files clean")
         if syntax_errors:
-            console.print(f"✗ {len(syntax_errors)} files had syntax errors")
-            if applied_fixes:
-                console.print(f"✅ {len(applied_fixes)} files FIXED & APPLIED to codebase")
-                console.print(f"   💾 Backups saved as .bak files\n")
-            else:
-                console.print("")
+            console.print(f"  ✗ {len(syntax_errors)} files had errors")
+        if applied_fixes:
+            console.print(f"  ✅ {len(applied_fixes)} files fixed")
+        console.print(f"{'─'*50}\n")
+    else:
+        # Non-syntax modes: just silently classify files
+        for file_path in files:
+            is_valid, _ = syntax_analyzer.analyze_file(file_path)
+            if is_valid:
+                valid_files.append(file_path)
     
     # Structural Analysis (symbol table + call graph)
+    # Phase 3 & 4: Structural Analysis
+    # Always build symbol table if needed for semantic analysis
     circular_deps = []
-    dead_code_symbols = []
+    dead_code_data = {}
     symbol_table = None
     parsed_files = {}
+    struct_results = None
     
-    # Always build symbol table for semantic analysis (needed for context)
-    # But only show structural results for 'full' and 'structural' modes
     if analysis_mode in ['full', 'structural', 'redundancy', 'semantic']:
         console.print("Building symbol table & call graph...")
         from analyzers.structural_analyzer import StructuralAnalyzer
         
         struct_analyzer = StructuralAnalyzer()
-        analysis_files = valid_files if valid_files else [f for f in files if f.suffix == '.py']
-        results = struct_analyzer.analyze_codebase(analysis_files)
+        analysis_files = valid_files if valid_files else files
+        struct_results = struct_analyzer.analyze_codebase(analysis_files)
         
-        symbol_table = results["symbol_table_object"]
-        circular_deps = results["circular_dependencies"]
-        dead_code_symbols = results["dead_code"]
+        symbol_table = struct_results["symbol_table_object"]
+        circular_deps = struct_results["circular_dependencies"]
+        dead_code_data = struct_results["dead_code"]
         
         # Reconstruct parsed_files for compatibility with Semantic Phase
-        for file_path_str, data in results["raw_data"].items():
+        for file_path_str, data in struct_results["raw_data"].items():
             fpath = Path(file_path_str)
             module_name = fpath.stem
             
             cg_functions = []
-            for f in data["functions"]:
+            for f in data.get("functions", []):
                  prefix = f"{f['parent_class']}." if f.get("parent_class") else ""
                  cg_functions.append({
                      "qualified_name": f"{module_name}.{prefix}{f['name']}",
@@ -303,40 +234,68 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
             
         console.print(f"✓ Symbol table built ({len(symbol_table.symbols)} symbols indexed)\n")
     
-    # Only show structural analysis results for 'structural' or 'full' modes, NOT for 'semantic'
-    if analysis_mode in ['full', 'structural']:
-        console.print("Cross-file analysis...")
-        if circular_deps:
-            console.print(f"  [red]✗ Found {len(circular_deps)} circular dependencies:[/red]")
-            for cycle in circular_deps:
-                cycle_str = " -> ".join([str(p) for p in cycle])
-                console.print(f"    • {cycle_str}")
-        else: console.print("  [green]✓ No circular imports found.[/green]")
+    # Only show structural analysis results for 'structural' or 'full' modes
+    if analysis_mode in ['full', 'structural'] and struct_results:
+        console.print("\n[bold blue]Phase 4: Dead Code & Cycle Detection[/bold blue]")
         
-        function_cycles = results.get("function_cycles", [])
-        if function_cycles:
-            console.print(f"  [red]✗ Found {len(function_cycles)} recursive function calls:[/red]")
-            for cycle in function_cycles:
-                cycle_str = " -> ".join([f"{s.name} ([dim]{s.file.name}:{s.line}[/dim])" for s in cycle])
-                first = cycle[0]
-                cycle_str += f" -> {first.name}"
-                console.print(f"    • {cycle_str}")
-            
-        if dead_code_symbols:
-            console.print(f"  [yellow]⚠ Found {len(dead_code_symbols)} dead code functions:[/yellow]")
-            for symbol in dead_code_symbols[:10]:
-                console.print(f"    • {symbol.name} ([dim]{symbol.file.name}:{symbol.line}[/dim])")
-            if len(dead_code_symbols) > 10: console.print(f"    ... and {len(dead_code_symbols)-10} more")
-        else: console.print("  [green]✓ No dead code detected.[/green]")
+        dead_data = struct_results.get("dead_code", {})
+        cycle_data = struct_results.get("cycles", {})
+        stats = struct_results.get("stats", {})
+
+        # Print Text Report as requested by user
+        print("\n" + "="*70)
+        print("STATIC CODE ANALYSIS REPORT")
+        print("="*70)
         
-        unused_vars = results.get("unused_variables", [])
-        if unused_vars:
-            console.print(f"  [yellow]⚠ Found {len(unused_vars)} unused variables:[/yellow]")
-            for var in unused_vars[:10]:
-                console.print(f"    • {var['name']} ([dim]{var['file']}:{var['line']}[/dim]) [{var['type']}]")
-            if len(unused_vars) > 10: console.print(f"    ... and {len(unused_vars)-10} more")
-        else: console.print("  [green]✓ No unused variables detected.[/green]")
-        console.print("")
+        # Summary
+        unused_funcs = dead_data.get("functions", [])
+        unused_vars = dead_data.get("variables", [])
+        total_unused = len(unused_funcs) + len(unused_vars)
+        
+        import_cycles = cycle_data.get("imports", [])
+        call_cycles = cycle_data.get("calls", [])
+        total_cycles = len(import_cycles) + len(call_cycles)
+        
+        print(f"\nSUMMARY:")
+        print(f"  Total symbols analyzed: {stats.get('total_symbols', 0)}")
+        print(f"  Total unused symbols: {total_unused}")
+        print(f"  Total cycles detected: {total_cycles}")
+        
+        # Unused Functions
+        print(f"\n{'='*70}")
+        print(f"UNUSED FUNCTIONS/METHODS ({len(unused_funcs)})")
+        print(f"{'='*70}")
+        for symbol in unused_funcs[:20]:
+            print(f"  [{symbol.language if hasattr(symbol, 'language') else 'unknown'}] {symbol.name} at {symbol.file}:{symbol.line}")
+        if len(unused_funcs) > 20:
+            print(f"  ... and {len(unused_funcs) - 20} more")
+        
+        # Unused Variables
+        print(f"\n{'='*70}")
+        print(f"UNUSED VARIABLES ({len(unused_vars)})")
+        print(f"{'='*70}")
+        for symbol in unused_vars[:20]:
+            print(f"  [{symbol.language if hasattr(symbol, 'language') else 'unknown'}] {symbol.name} at {symbol.file}:{symbol.line}")
+        if len(unused_vars) > 20:
+            print(f"  ... and {len(unused_vars) - 20} more")
+        
+        # Import Cycles
+        print(f"\n{'='*70}")
+        print(f"IMPORT CYCLES ({len(import_cycles)})")
+        print(f"{'='*70}")
+        for cycle in import_cycles:
+            print(f"  {cycle}")
+        
+        # Call Cycles
+        print(f"\n{'='*70}")
+        print(f"CALL CYCLES ({len(call_cycles)})")
+        print(f"{'='*70}")
+        for cycle in call_cycles:
+            print(f"  {cycle}")
+        
+        print("\n" + "="*70)
+
+
     
     # Semantic Bug Detection
     if analysis_mode in ['full', 'semantic']:
@@ -346,11 +305,218 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
         bug_detector = LLMBugDetector(llm_client)
         fix_generator = FixGenerator(llm_client)
         
-        # We need lang_map if we didn't run Phase 2
         if 'lang_map' not in locals():
-                    lang_map = {'.py': 'python'}
+            lang_map = {'.py': 'python'}
 
-        for file_path in (valid_files if valid_files else files):
+        # Interactive Semantic Analysis Loop
+        from rich.prompt import Prompt
+        from analyzers.fix_generator import FixGenerator
+        
+        # Ensure helper objects are ready
+        fix_gen = FixGenerator(llm_client)
+        if 'struct_analyzer' not in locals():
+            from analyzers.structural_analyzer import StructuralAnalyzer
+            struct_analyzer = StructuralAnalyzer()
+
+        # Iterate through files interactively
+        analysis_queue = valid_files if valid_files else files
+        
+        for file_idx, file_path in enumerate(analysis_queue, 1):
+            if file_path.name in ['.gitignore', 'requirements.txt']: continue
+            
+            # Clear screen for focus
+            os.system('cls' if os.name == 'nt' else 'clear')
+            console.print(Panel(f"[bold]Analyzing File {file_idx}/{len(analysis_queue)}:[/bold] {file_path.name}", style="cyan"))
+            
+            analyzed_symbols = set()
+            
+            while True: # Function Loop (supports re-parsing after edits)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        code = f.read()
+                except Exception as e:
+                    console.print(f"[red]Error reading {file_path.name}: {e}[/red]")
+                    break
+                
+                # Dynamic re-parse of the single file
+                parse_result = struct_analyzer.parser.parse(code, file_path)
+                functions = parse_result.get("functions", [])
+                
+                # Context extraction (Imports & Globals) form parsed result
+                imports_str = ""
+                global_vars_str = ""
+                
+                # Imports
+                parsed_imports = parse_result.get("imports", [])
+                if parsed_imports:
+                    imp_lines = []
+                    for imp in parsed_imports:
+                        if isinstance(imp, dict):
+                            mod = imp.get("module", "")
+                            nms = imp.get("names", [])
+                            if nms: imp_lines.append(f"from {mod} import {', '.join(nms)}")
+                            elif mod: imp_lines.append(mod)
+                        else: imp_lines.append(str(imp))
+                    imports_str = "\n".join(imp_lines)
+                
+                parsed_globals = parse_result.get("global_vars", [])
+                if parsed_globals:
+                    global_vars_str = "\n".join(parsed_globals)
+                
+                # Analyze Globals First (if not already done for this file)
+                if global_vars_str and "Global Variables" not in analyzed_symbols:
+                    analyzed_symbols.add("Global Variables")
+                    # console.print(f"  [dim]Scanning Global Variables...[/dim]")
+                    
+                    language = lang_map.get(file_path.suffix, 'python')
+                    
+                    global_bugs = await bug_detector.analyze_symbol(
+                        "Global Variables", global_vars_str, language, file_path,
+                        class_context="", dependency_hints="", 
+                        global_vars="", imports_list=imports_str
+                    )
+                    
+                    global_priority_bugs = [b for b in global_bugs if b.severity.lower() in ['critical', 'high']]
+                    
+                    if global_priority_bugs:
+                         for bug in global_priority_bugs:
+                             console.print("\n" + "─"*50)
+                             console.print(f"[bold red]BUG DETECTED[/bold red] in [cyan]Global Variables[/cyan]")
+                             console.print(f"[red]Issue:[/red] {bug.description}")
+                             console.print(f"[green]Suggestion:[/green] {bug.suggestion}")
+                         
+                         Prompt.ask("\n[bold]Press Enter to continue to functions...[/bold]", choices=[""], default="")
+                
+                # Find next unanalyzed function
+                target_func = None
+                for f in functions:
+                    if f['name'] not in analyzed_symbols:
+                        target_func = f
+                        break
+                
+                if not target_func:
+                    break # File complete
+                
+                sym_name = target_func['name']
+                analyzed_symbols.add(sym_name)
+                
+                # Build Class Context if needed
+                class_ctx = ""
+                if target_func.get("parent_class"):
+                    cls_name = target_func["parent_class"]
+                    cls_data = next((c for c in parse_result.get("classes", []) if c["name"] == cls_name), None)
+                    if cls_data:
+                        skel = [f"class {cls_name} {{"]
+                        if cls_data.get("attributes"):
+                            skel.append("    // Fields")
+                            for a in cls_data["attributes"]: skel.append(f"    {a};")
+                        
+                        skel.append("    // ... other methods ...")
+                        skel.append(f"    // === TARGET: {sym_name} ===")
+                        for l in target_func["body_code"].splitlines():
+                            skel.append(f"    {l}")
+                        skel.append("}")
+                        class_ctx = "\n".join(skel)
+
+                # Build Dependency Hints (Callers/Callees) - using global symbol table (snapshot)
+                dep_hints = ""
+                if target_func.get("calls"):
+                    dep_hints += "Functions this calls:\n" + ", ".join(target_func["calls"]) + "\n"
+
+                # Analyze
+                # console.print(f"  [dim]Scanning {sym_name}...[/dim]")
+                language = lang_map.get(file_path.suffix, 'python')
+                
+                bugs = await bug_detector.analyze_symbol(
+                    sym_name, target_func["body_code"], language, file_path,
+                    class_context=class_ctx, dependency_hints=dep_hints,
+                    global_vars=global_vars_str, imports_list=imports_str
+                )
+                
+                # STIFF FILTER: Only show CRITICAL/HIGH severity bugs as requested
+                priority_bugs = [b for b in bugs if b.severity.lower() in ['critical', 'high']]
+                
+                if not priority_bugs:
+                    continue
+
+                # BUG FOUND
+                for bug in priority_bugs:
+                    console.print("\n" + "─"*50)
+                    console.print(f"[bold red]BUG DETECTED[/bold red] in [cyan]{sym_name}[/cyan]")
+                    console.print(f"[red]Issue:[/red] {bug.description}")
+                    console.print(f"[green]Suggestion:[/green] {bug.suggestion}")
+                    
+                    # Generate Fix
+                    console.print("[dim]Generating fix...[/dim]")
+                    fix_obj = await fix_gen.generate_fix(
+                        bug.type, bug.severity, file_path, bug.line,
+                        target_func["body_code"], language, bug.description, bug.suggestion,
+                        global_context=f"{imports_str}\n{global_vars_str}"
+                    )
+                    
+                    if fix_obj and fix_obj.fixed_code:
+                        # Show Diff
+                        console.print(Panel(
+                            Syntax(fix_obj.fixed_code, language, theme="monokai", line_numbers=True),
+                            title="[bold green]PROPOSED FIX[/bold green]", expand=False
+                        ))
+                        
+                        choice = Prompt.ask(
+                            "\n[bold]Action [[white]Enter[/white]=Apply, [white]s[/white]=Skip][/bold]", 
+                            choices=["apply", "skip"], 
+                            default="apply"
+                        )
+                        
+                        if choice == "apply":
+                            # Apply Fix: Replace function body in file
+                            start_byte = target_func.get("start_byte")
+                            end_byte = target_func.get("end_byte")
+                            
+                            # Python fallback: use line numbers if bytes missing
+                            if start_byte is None and target_func.get("line"):
+                                start_line = target_func["line"] - 1 # 0-indexed
+                                end_line = target_func.get("end_line")
+                                if end_line:
+                                    lines = code.splitlines(keepends=True)
+                                    # Replace lines
+                                    new_code = "".join(lines[:start_line]) + fix_obj.fixed_code + "\n" + "".join(lines[end_line:])
+                                    with open(file_path, 'w', encoding='utf-8') as f:
+                                        f.write(new_code)
+                                    console.print("[bold green]✓ Fix Applied![/bold green]")
+                                    time.sleep(1)
+                                    # Break inner loop to re-parse file (offsets changed)
+                                    break 
+                                else:
+                                    console.print("[bold red]Cannot apply Python fix: missing end_line info.[/bold red]")
+                            
+                            elif start_byte is not None and end_byte is not None:
+                                try:
+                                    code_bytes = code.encode('utf-8')
+                                    fix_bytes = fix_obj.fixed_code.encode('utf-8')
+                                    
+                                    new_bytes = code_bytes[:start_byte] + fix_bytes + code_bytes[end_byte:]
+                                    new_code = new_bytes.decode('utf-8')
+                                    
+                                    with open(file_path, 'w', encoding='utf-8') as f:
+                                        f.write(new_code)
+                                        
+                                    console.print("[bold green]✓ Fix Applied![/bold green]")
+                                    time.sleep(1)
+                                    break # Re-parse
+                                except Exception as e:
+                                     console.print(f"[red]Error applying fix: {e}[/red]")
+
+                        # elif choice == "skip": pass # Implicit continue
+                    else:
+                        console.print("[yellow]Could not generate a fix code block.[/yellow]")
+                        
+                if target_func is None: # explicit next file
+                    break
+        
+        console.print("[bold green]Semantic Analysis Complete.[/bold green]")
+
+        # OLD LOOP DISABLED
+        for file_path in []: # (valid_files if valid_files else files):
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     code = f.read()
@@ -369,99 +535,184 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
                             "description": issue["message"],
                             "suggestion": "Define variable or fix reference."
                         })
-                        # User requested to hide static errors to reduce noise
-                        # console.print(f"    [red]• Static Error:[/] {issue['message']} at line {issue['line']}")
                 
                 # 2. Detect bugs using vLLM (Semantic)
-                language = lang_map.get(file_path.suffix, 'python')
+                language = lang_map.get(file_path.suffix, file_path.suffix.lstrip('.'))
                 detected_bugs = []
                 
                 # Force focused analysis if symbol table is available for better context
                 if symbol_table and len(file_symbols := symbol_table.get_symbols_in_file(file_path)) > 0:
                     console.print(f"    [dim]Context-Aware Audit: Analyzing {len(file_symbols)} symbols...[/dim]")
                     
-                    # Extract Module-Level Context (Once per file)
-                    import ast
+                    # Extract Module-Level Context from parsed data
                     global_vars_str = ""
                     imports_str = ""
                     try:
-                        tree = ast.parse(code)
-                        # Extract imports
-                        imports = []
-                        for node in ast.walk(tree):
-                            if isinstance(node, ast.Import):
-                                for alias in node.names:
-                                    imports.append(f"import {alias.name}" + (f" as {alias.asname}" if alias.asname else ""))
-                            elif isinstance(node, ast.ImportFrom):
-                                module = node.module or ""
-                                names = ", ".join([alias.name + (f" as {alias.asname}" if alias.asname else "") for alias in node.names])
-                                imports.append(f"from {module} import {names}")
-                        imports_str = "\n".join(imports)
+                        file_data = results.get("raw_data", {}).get(str(file_path), {})
                         
-                        # Extract global variables (module-level assignments)
-                        globals_list = []
-                        for node in tree.body:
-                            if isinstance(node, ast.Assign):
-                                for target in node.targets:
-                                    if isinstance(target, ast.Name):
-                                        # Get value as string (approximation)
-                                        try:
-                                            val_str = ast.unparse(node.value) if hasattr(ast, 'unparse') else "..."
-                                        except:
-                                            val_str = "..."
-                                        globals_list.append(f"{target.id} = {val_str}")
-                        global_vars_str = "\n".join(globals_list)
+                        # Imports: from parsed data (works for all languages)
+                        parsed_imports = file_data.get("imports", [])
+                        if parsed_imports:
+                            import_lines = []
+                            for imp in parsed_imports:
+                                if isinstance(imp, dict):
+                                    module = imp.get("module", "")
+                                    names = imp.get("names", [])
+                                    if names:
+                                        import_lines.append(f"from {module} import {', '.join(names)}")
+                                    elif module:
+                                        import_lines.append(module)
+                                else:
+                                    import_lines.append(str(imp))
+                            imports_str = "\n".join(import_lines)
+                        
+                        # Global variables: from parsed data
+                        parsed_globals = file_data.get("global_vars", [])
+                        if parsed_globals:
+                            global_vars_str = "\n".join(parsed_globals)
+                        
+                        # Python fallback: ast-based extraction for richer context
+                        if file_path.suffix == '.py' and not imports_str:
+                            import ast as ast_mod
+                            py_tree = ast_mod.parse(code)
+                            py_imports = []
+                            for node in ast_mod.walk(py_tree):
+                                if isinstance(node, ast_mod.Import):
+                                    for alias in node.names:
+                                        py_imports.append(f"import {alias.name}" + (f" as {alias.asname}" if alias.asname else ""))
+                                elif isinstance(node, ast_mod.ImportFrom):
+                                    module = node.module or ""
+                                    names = ", ".join([alias.name + (f" as {alias.asname}" if alias.asname else "") for alias in node.names])
+                                    py_imports.append(f"from {module} import {names}")
+                            imports_str = "\n".join(py_imports)
+                            
+                            py_globals = []
+                            for node in py_tree.body:
+                                if isinstance(node, ast_mod.Assign):
+                                    for target in node.targets:
+                                        if isinstance(target, ast_mod.Name):
+                                            try:
+                                                val_str = ast_mod.unparse(node.value) if hasattr(ast_mod, 'unparse') else "..."
+                                            except:
+                                                val_str = "..."
+                                            py_globals.append(f"{target.id} = {val_str}")
+                            global_vars_str = "\n".join(py_globals)
                     except:
                         pass
                     
                     for sym in file_symbols:
                         if sym.type == SymbolType.FUNCTION:
-                            # 1. Build Class Context if needed
+                            # 1. Build structured Class Skeleton if function is in a class
                             class_ctx = ""
                             if sym.parent_name:
                                 class_syms = [s for s in file_symbols if s.name == sym.parent_name and s.type == SymbolType.CLASS]
                                 if class_syms:
                                     cls = class_syms[0]
-                                    other_methods = [s.signature for s in file_symbols if s.parent_name == sym.parent_name and s.name != sym.name]
-                                    class_ctx = f"Class: {cls.name}\nAttributes: {', '.join(cls.attributes)}\nOther methods: {', '.join(other_methods)}"
+                                    # Build code-like skeleton
+                                    skeleton_lines = [f"class {cls.name} {{"]
+                                    
+                                    # Class fields/attributes
+                                    if cls.attributes:
+                                        skeleton_lines.append("    // Fields")
+                                        for attr in cls.attributes:
+                                            skeleton_lines.append(f"    {attr};")
+                                        skeleton_lines.append("")
+                                    
+                                    # Other method signatures (before target)
+                                    other_before = []
+                                    other_after = []
+                                    found_target = False
+                                    all_methods = [s for s in file_symbols if s.parent_name == sym.parent_name and s.type == SymbolType.FUNCTION]
+                                    for m in all_methods:
+                                        if m.name == sym.name:
+                                            found_target = True
+                                            continue
+                                        if not found_target:
+                                            other_before.append(m)
+                                        else:
+                                            other_after.append(m)
+                                    
+                                    if other_before:
+                                        for m in other_before:
+                                            skeleton_lines.append(f"    {m.signature};")
+                                        skeleton_lines.append("")
+                                    
+                                    # Target function — full code
+                                    skeleton_lines.append(f"    // === TARGET FUNCTION ===")
+                                    for line in sym.body_code.splitlines():
+                                        skeleton_lines.append(f"    {line}")
+                                    skeleton_lines.append("")
+                                    
+                                    # Other method signatures (after target)
+                                    if other_after:
+                                        for m in other_after:
+                                            skeleton_lines.append(f"    {m.signature};")
+                                        skeleton_lines.append("")
+                                    
+                                    skeleton_lines.append("}")
+                                    class_ctx = "\n".join(skeleton_lines)
                             
-                            # 2. Build Enhanced Dependency Hints (Cross-File + Same-File)
+                            # 2. Build call graph context (callees + callers)
                             dep_hints = ""
+                            
+                            # 2a. What this function CALLS (callees)
                             sym_data = next((f for f in parsed_files[file_path]["functions"] if f["qualified_name"].endswith(f".{sym.name}")), None)
+                            callees_list = []
                             if sym_data:
                                 for call in sym_data.get("calls", []):
                                     all_syms = symbol_table.find_symbols_by_name(call)
-                                    # Include ALL functions (cross-file AND same-file) called by this symbol
-                                    for ext in all_syms[:3]: # Limit hints
-                                        if ext.qualified_name != sym.qualified_name: # Don't include self
+                                    for ext in all_syms[:3]:
+                                        if ext.qualified_name != sym.qualified_name:
                                             location = "cross-file" if ext.file != file_path else "same-file"
-                                            dep_hints += f"- {ext.qualified_name} ({location}): {ext.signature}\n"
+                                            callees_list.append(f"- {ext.qualified_name} ({location}): {ext.signature}")
+                            if callees_list:
+                                dep_hints += "Functions this calls:\n" + "\n".join(callees_list) + "\n"
+                            
+                            # 2b. Which functions CALL this function (callers — reverse lookup)
+                            callers_list = []
+                            for fp_str, fp_data in parsed_files.items():
+                                for func_info in fp_data.get("functions", []):
+                                    if sym.name in func_info.get("calls", []):
+                                        caller_name = func_info["qualified_name"]
+                                        if caller_name != sym.qualified_name:
+                                            loc = "cross-file" if str(file_path) != fp_str else "same-file"
+                                            caller_sym = symbol_table.find_symbols_by_name(func_info["qualified_name"].split(".")[-1])
+                                            sig = caller_sym[0].signature if caller_sym else caller_name
+                                            callers_list.append(f"- {caller_name} ({loc}): {sig}")
+                            if callers_list:
+                                dep_hints += "Called by:\n" + "\n".join(callers_list) + "\n"
                             
                             sym_bugs = await bug_detector.analyze_symbol(
                                 sym.name, sym.body_code, language, file_path, 
                                 class_context=class_ctx, dependency_hints=dep_hints,
-                                global_vars=global_vars_str, imports_list=imports_str,
-                                verbose=verbose
+                                global_vars=global_vars_str, imports_list=imports_str
                             )
+                            # Show progress
+                            console.print(f"    [dim]Analyzed {sym.name}...[/dim]")
                             detected_bugs.extend(sym_bugs)
                         
                         elif sym.type == SymbolType.CLASS:
-                            # Analyze class-level code (attributes, properties, etc.)
-                            # Build inheritance hints
                             inheritance_hints = ""
-                            # Check if class inherits from others in the symbol table
-                            # This is a simplified check - full implementation would parse bases
                             
                             class_bugs = await bug_detector.analyze_symbol(
                                 sym.name, sym.body_code, language, file_path,
-                                class_context="",  # Classes don't have parent class context
+                                class_context="",
                                 dependency_hints=inheritance_hints,
-                                global_vars=global_vars_str, imports_list=imports_str,
-                                verbose=verbose
+                                global_vars=global_vars_str, imports_list=imports_str
                             )
                             detected_bugs.extend(class_bugs)
+                    
+                    # 3. Analyze global variables for bugs (if any exist)
+                    if global_vars_str:
+                        global_bugs = await bug_detector.analyze_symbol(
+                            "Global Variables", global_vars_str, language, file_path,
+                            class_context="",
+                            dependency_hints="",
+                            global_vars="", imports_list=imports_str
+                        )
+                        detected_bugs.extend(global_bugs)
                 else:
-                    detected_bugs = await bug_detector.analyze_code(file_path, code, language, verbose=verbose)
+                    detected_bugs = await bug_detector.analyze_code(file_path, code, language)
                 
                 for bug in detected_bugs:
                     bugs.append({
@@ -492,7 +743,6 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
                     
                     # Auto-generate patch (no user permission needed)
                     if generate_fixes:
-                        # Extract global context (imports/constants)
                         global_context = syntax_fix_generator._extract_global_context(code)
                         
                         console.print(f"  [cyan]⚡ Auto-generating patch for line {bug.line}...[/cyan]")
@@ -502,9 +752,7 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
                         )
                         
                         if fix:
-                            # Show clean code snippet instead of diff (User preference: no + signs)
                             fixed_lines = fix.fixed_code.splitlines()
-                            # Centered around the bug line
                             start_idx = max(0, bug.line - 4)
                             end_idx = min(len(fixed_lines), bug.line + 5)
                             snippet = "\n".join(fixed_lines[start_idx:end_idx])
@@ -514,7 +762,6 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
                                 Syntax(snippet, language, theme="monokai", line_numbers=True, start_line=start_idx+1),
                                 f"\n[bold blue]Explanation:[/bold blue] {fix.explanation}"
                             )
-                            # Use minimal box to reduce vertical lines if user dislikes them
                             from rich import box
                             console.print(Panel(
                                 fix_info, 
@@ -523,7 +770,6 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
                                 box=box.ROUNDED
                             ))
                             
-                            # Ask permission to PROCEED to next bug (not to generate patch)
                             if typer.confirm(f"  Apply this patch and proceed to next bug?", default=True):
                                 apply_result = syntax_fix_generator.apply_fix_to_file(
                                     file_path,
@@ -538,7 +784,6 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
                                         "fixed_code": fix.fixed_code,
                                         "explanation": fix.explanation
                                     })
-                                    # Update 'code' variable for next bug in same file
                                     code = fix.fixed_code
                                     console.print(f"  [green]✅ Applied & Verified. Backup: {apply_result.get('backup_path')}[/green]")
                                 else:
@@ -580,7 +825,6 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
             "folder": str(folder),
             "files_analyzed": len(files),
             "files_with_syntax_errors": len(syntax_errors),
-            "syntax_errors_fixed": len(syntax_fixes),
             "fixes_applied_to_codebase": len(applied_fixes),
             "valid_files": len(valid_files)
         },
@@ -592,7 +836,6 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
             "low": len([b for b in bugs if b.get("severity") == "low"])
         },
         "syntax_errors": syntax_errors,
-        "syntax_fixes": syntax_fixes,
         "bugs": bugs,
         "fixes": fixes,
         "cross_file_analysis": {
@@ -622,24 +865,6 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
     
     console.print(f"\n[green]✅ JSON report saved to:[/green] {output}")
     console.print(f"[green]✅ HTML dashboard saved to:[/green] {html_path}")
-    """
-    # Summary Table
-    table = Table(title="Analysis Summary")
-    table.add_column("Metric", style="cyan")
-    table.add_column("Value", style="magenta")
-    
-    table.add_row("Total Files", str(len(files)))
-    table.add_row("Valid Files", str(len(valid_files)))
-    table.add_row("Syntax Errors", str(len(syntax_errors)))
-    table.add_row("Syntax Fixes (vLLM)", str(len(syntax_fixes)))
-    table.add_row("Bugs Found (vLLM)", str(len(bugs)))
-    table.add_row("Bug Fixes Generated", str(len(fixes)))
-    table.add_row("Circular Dependencies", str(len(circular_deps)))
-    table.add_row("Dead Code Functions", str(len(dead_code_symbols)))
-    table.add_row("Duplicate Groups", str(len(duplicates)))
-    
-    console.print(table)
-    """
 
 if __name__ == "__main__":
     app()

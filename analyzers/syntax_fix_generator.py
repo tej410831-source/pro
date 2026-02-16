@@ -45,19 +45,12 @@ class SyntaxFixGenerator:
         self,
         file_path: Path,
         code: str,
-        errors: List
+        errors: List,
+        verbose: bool = False
     ) -> Dict:
         """
         Suggest fixes for syntax errors sequentially, waiting for USER to apply them.
         """
-        # Header is kept (as requested)
-        print(f"\n🔍 Analysis for {file_path.name}: Found {len(errors)} error(s)")
-        print(f"{'Line':<8} {'Error Type':<15} {'Message'}")
-        print("─" * 70)
-        for err in errors:
-            err_type = err.parser if hasattr(err, 'parser') else 'SyntaxError'
-            print(f"{err.line:<8} {err_type:<15} {err.message[:60]}")
-        print()
         
         fixes_presented = 0
         
@@ -68,7 +61,8 @@ class SyntaxFixGenerator:
                 fix_result = await self._fix_single_error(
                     code,
                     error,
-                    file_path
+                    file_path,
+                    verbose=verbose
                 )
                 
                 if not fix_result['success']:
@@ -87,17 +81,9 @@ class SyntaxFixGenerator:
                 print(f"ℹ️  Wait: {explanation}")
                 
                 while True:
-                    # Clean, simple prompt
-                    choice = input(f"\n> Apply fix? [a]pply, [Enter] when pasted, [s]kip, [q]uit: ").strip().lower()
+                    choice = input(f"\n> [Enter] when fixed, [s]kip, [q]uit: ").strip().lower()
                     
-                    if choice == 'a': # Auto-apply
-                        new_code = self.apply_patch_to_code(code, region, fixed_code)
-                        with open(file_path, 'w', encoding='utf-8') as f:
-                            f.write(new_code)
-                        print(f"  ✓ Applied and saved to {file_path.name}")
-                        fixes_presented += 1
-                        break
-                    elif choice == '': # User pressed Enter (Applied manually)
+                    if choice == '': # User pressed Enter (fixed manually)
                         fixes_presented += 1
                         break
                     elif choice == 's': # Skip this error
@@ -217,7 +203,7 @@ class SyntaxFixGenerator:
             'patches': patches_applied
         }
     
-    async def _fix_single_error(self, code: str, error, file_path: Path) -> Dict:
+    async def _fix_single_error(self, code: str, error, file_path: Path, verbose: bool = False) -> Dict:
         """
         Fix a single syntax error with focused context.
         
@@ -225,6 +211,7 @@ class SyntaxFixGenerator:
             code: Current code (may have previous patches)
             error: Single FileSyntaxError
             file_path: Path (for language detection)
+            verbose: Whether to print LLM prompts
         
         Returns:
             {
@@ -238,8 +225,8 @@ class SyntaxFixGenerator:
         lines = code.split('\n')
         error_line_idx = error.line - 1  # 0-indexed
         
-        # Extract a SMALL window around the error (+/- 5 lines)
-        window_size = 5
+        # Extract a window around the error (+/- 20 lines)
+        window_size = 20
         start_line = max(0, error_line_idx - window_size)
         end_line = min(len(lines), error_line_idx + window_size + 1)
         
@@ -294,6 +281,9 @@ If line has: "class Foo {{" (missing closing brace)
 Fix to: "class Foo {{}}" (add closing brace)
 Return ALL lines, not just the changed one.
 """
+        
+        if verbose:
+            print(f"\n[VERBOSE] Generating fix with prompt:\n{'-'*40}\n{prompt}\n{'-'*40}")
         
         try:
             response = await self.llm_client.generate_completion(prompt, temperature=0.1)
