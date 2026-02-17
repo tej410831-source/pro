@@ -118,29 +118,7 @@ class StructuralParser:
                 self.classes = []
                 self.imports = []
                 self.calls_in_current = []
-                self.calls_in_current = []
-                self.identifiers = []
-                self.variables = []
-
-            def visit_Name(self, node):
-                if isinstance(node, ast.Name):
-                    self.identifiers.append(node.id)
-                self.generic_visit(node)
-
-            def visit_Assign(self, node):
-                # Only capture top-level variables (not inside function/class)
-                if self.current_function is None and self.current_class is None:
-                    for target in node.targets:
-                        if isinstance(target, ast.Name):
-                            self.variables.append({"name": target.id, "line": node.lineno})
-                self.generic_visit(node)
-
-            def visit_AnnAssign(self, node):
-                 # Only capture top-level variables
-                if self.current_function is None and self.current_class is None:
-                    if isinstance(node.target, ast.Name):
-                        self.variables.append({"name": node.target.id, "line": node.lineno})
-                self.generic_visit(node)
+                self.calls_detailed_in_current = []
 
             def visit_Import(self, node):
                 names = [alias.name for alias in node.names]
@@ -156,11 +134,20 @@ class StructuralParser:
                 prev_class = self.current_class
                 self.current_class = node.name
                 
+                # Extract base class names
+                bases = []
+                for base in node.bases:
+                    if isinstance(base, ast.Name):
+                        bases.append(base.id)
+                    elif isinstance(base, ast.Attribute):
+                        bases.append(base.attr)
+                
                 class_data = {
                     "name": node.name,
                     "line": node.lineno,
                     "methods": [],
-                    "attributes": []
+                    "attributes": [],
+                    "bases": bases
                 }
                 
                 for item in node.body:
@@ -179,6 +166,7 @@ class StructuralParser:
                 
                 self.current_function = node.name
                 self.calls_in_current = []
+                self.calls_detailed_in_current = []
                 
                 args = [arg.arg for arg in node.args.args]
                 signature = f"{node.name}({', '.join(args)})"
@@ -188,15 +176,30 @@ class StructuralParser:
                 except:
                     body_code = ""
 
+                # Extract decorator names
+                decorators = []
+                for dec in node.decorator_list:
+                    if isinstance(dec, ast.Name):
+                        decorators.append(dec.id)
+                    elif isinstance(dec, ast.Attribute):
+                        decorators.append(dec.attr)
+                    elif isinstance(dec, ast.Call):
+                        if isinstance(dec.func, ast.Name):
+                            decorators.append(dec.func.id)
+                        elif isinstance(dec.func, ast.Attribute):
+                            decorators.append(dec.func.attr)
+
                 self.generic_visit(node)
                 
                 func_data = {
                     "name": node.name,
                     "line": node.lineno,
                     "signature": signature,
-                    "body_code": body_code or "",
-                    "calls": self.calls_in_current,
-                    "parent_class": self.current_class
+                    "body_code": body_code,
+                    "calls": [c["name"] for c in self.calls_detailed_in_current],
+                    "calls_detailed": self.calls_detailed_in_current,
+                    "parent_class": self.current_class,
+                    "decorators": decorators
                 }
                 self.functions.append(func_data)
                 
@@ -213,13 +216,32 @@ class StructuralParser:
 
             def visit_Call(self, node):
                 call_name = None
+                receiver = None  # "self", "super", a class name, or None (bare call)
+                
                 if isinstance(node.func, ast.Name):
                     call_name = node.func.id
+                    receiver = None  # bare call like foo()
                 elif isinstance(node.func, ast.Attribute):
                     call_name = node.func.attr
+                    # Determine receiver
+                    val = node.func.value
+                    if isinstance(val, ast.Name):
+                        if val.id == "self":
+                            receiver = "self"
+                        elif val.id == "super":
+                            receiver = "super"
+                        else:
+                            receiver = val.id  # ClassName.method()
+                    elif isinstance(val, ast.Call):
+                        # super().__init__() — val is Call to super
+                        if isinstance(val.func, ast.Name) and val.func.id == "super":
+                            receiver = "super"
                 
                 if call_name:
-                    self.calls_in_current.append(call_name)
+                    self.calls_detailed_in_current.append({
+                        "name": call_name,
+                        "receiver": receiver
+                    })
                     all_calls.append(call_name)
                 
                 self.generic_visit(node)

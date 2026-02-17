@@ -246,251 +246,386 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
         dead_code_symbols = dead_code_data.get("functions", []) + dead_code_data.get("variables", [])
         console.print(f"✓ Symbol table built ({len(symbol_table.symbols)} symbols indexed)\n")
     
-    # Only show structural analysis results for 'structural' or 'full' modes
-    if analysis_mode in ['full', 'structural'] and struct_results:
-        console.print("\n[bold blue]Phase 2: Dead Code & Cycle Detection[/bold blue]")
+    # Only show structural analysis results for 'structural' or 'full' modes, NOT for 'semantic'
+    if analysis_mode in ['full', 'structural']:
+        unused_vars = results.get("unused_variables", [])
+        function_cycles = results.get("function_cycles", [])
         
-        dead_data = struct_results.get("dead_code", {})
-        cycle_data = struct_results.get("cycles", {})
-        stats = struct_results.get("stats", {})
-
-        # Print Text Report as requested by user
-        print("\n" + "="*70)
-        print("STATIC CODE ANALYSIS REPORT")
-        print("="*70)
+        # Collect all files analyzed
+        analysis_files_set = set()
+        for s in dead_code_symbols:
+            analysis_files_set.add(s.file)
+        for v in unused_vars:
+            # Match var file name back to actual Path
+            for fp_str in results.get("raw_data", {}).keys():
+                if Path(fp_str).name == v["file"]:
+                    analysis_files_set.add(Path(fp_str))
+        # Also include files from valid_files/files
+        for f in (valid_files if valid_files else files):
+            analysis_files_set.add(f)
         
-        # Summary
-        unused_funcs = dead_data.get("functions", [])
-        unused_vars = dead_data.get("variables", [])
-        total_unused = len(unused_funcs) + len(unused_vars)
+        sorted_files = sorted(analysis_files_set, key=lambda p: p.name)
         
-        import_cycles = cycle_data.get("imports", [])
-        call_cycles = cycle_data.get("calls", [])
-        total_cycles = len(import_cycles) + len(call_cycles)
+        # ═══ Section 1: Unused Variables (file by file) ═══
+        console.print("[bold yellow]═══ Unused Variables ═══[/bold yellow]\n")
+        total_unused = 0
+        for fpath in sorted_files:
+            file_vars = [v for v in unused_vars if v["file"] == fpath.name]
+            if not file_vars:
+                continue
+            total_unused += len(file_vars)
+            console.print(f"  [bold cyan]📄 {fpath.name}[/bold cyan]")
+            for var in file_vars:
+                vtype = "global" if var["type"] == "global_variable" else "local"
+                console.print(f"    • [yellow]{var['name']}[/yellow] (line {var['line']}) \\[{vtype}]")
+            console.print()
+        if total_unused == 0:
+            console.print("  [green]✓ No unused variables detected.[/green]\n")
+        else:
+            console.print(f"  [dim]Total: {total_unused} unused variable(s)[/dim]\n")
         
-        print(f"\nSUMMARY:")
-        print(f"  Total symbols analyzed: {stats.get('total_symbols', 0)}")
-        print(f"  Total unused symbols: {total_unused}")
-        print(f"  Total cycles detected: {total_cycles}")
+        # ═══ Section 2: Dead Code / Uncalled Functions (file by file) ═══
+        console.print("[bold yellow]═══ Uncalled Functions ═══[/bold yellow]\n")
+        total_dead = 0
+        for fpath in sorted_files:
+            file_dead = [s for s in dead_code_symbols if s.file == fpath]
+            if not file_dead:
+                continue
+            total_dead += len(file_dead)
+            console.print(f"  [bold cyan]📄 {fpath.name}[/bold cyan]")
+            for sym in file_dead:
+                parent = f" ({sym.parent_name})" if sym.parent_name else ""
+                console.print(f"    • [yellow]{sym.name}[/yellow]{parent} (line {sym.line})")
+            console.print()
+        if total_dead == 0:
+            console.print("  [green]✓ No uncalled functions detected.[/green]\n")
+        else:
+            console.print(f"  [dim]Total: {total_dead} uncalled function(s)[/dim]\n")
         
-        # Unused Functions
-        print(f"\n{'='*70}")
-        print(f"UNUSED FUNCTIONS/METHODS ({len(unused_funcs)})")
-        print(f"{'='*70}")
-        for symbol in unused_funcs:
-            lang = symbol.file.suffix.lstrip('.')
-            print(f"  [{lang}] {symbol.name} at {symbol.file}:{symbol.line}")
+        # ═══ Section 3: Recursive / Cycle Calls ═══
+        console.print("[bold yellow]═══ Recursive / Cycle Calls ═══[/bold yellow]\n")
+        if function_cycles:
+            for i, cycle in enumerate(function_cycles, 1):
+                cycle_str = " → ".join([f"{s.name} ([dim]{s.file.name}:{s.line}[/dim])" for s in cycle])
+                cycle_str += f" → {cycle[0].name}"
+                console.print(f"  {i}. {cycle_str}")
+            console.print(f"\n  [dim]Total: {len(function_cycles)} cycle(s)[/dim]\n")
+        else:
+            console.print("  [green]✓ No recursive cycles detected.[/green]\n")
         
-        # Unused Variables
-        print(f"\n{'='*70}")
-        print(f"UNUSED VARIABLES ({len(unused_vars)})")
-        print(f"{'='*70}")
-        for symbol in unused_vars:
-            lang = symbol.file.suffix.lstrip('.')
-            print(f"  [{lang}] {symbol.name} at {symbol.file}:{symbol.line}")
-        
-        # Import Cycles
-        print(f"\n{'='*70}")
-        print(f"IMPORT CYCLES ({len(import_cycles)})")
-        print(f"{'='*70}")
-        for cycle in import_cycles:
-            print(f"  {cycle}")
-        
-        # Call Cycles
-        print(f"\n{'='*70}")
-        print(f"CALL CYCLES ({len(call_cycles)})")
-        print(f"{'='*70}")
-        for cycle in call_cycles:
-            print(f"  {cycle}")
-        
-        print("\n" + "="*70)
-
-
+        # ═══ Section 4: Circular Imports ═══
+        console.print("[bold yellow]═══ Circular Imports ═══[/bold yellow]\n")
+        if circular_deps:
+            for i, cycle in enumerate(circular_deps, 1):
+                cycle_str = " → ".join([str(p) for p in cycle])
+                console.print(f"  {i}. {cycle_str}")
+            console.print(f"\n  [dim]Total: {len(circular_deps)} circular import(s)[/dim]\n")
+        else:
+            console.print("  [green]✓ No circular imports detected.[/green]\n")
+        console.print()
     
     # Phase 3: Semantic Bug Detection
     if analysis_mode in ['full', 'semantic']:
-        console.print("\n[bold blue]Phase 3: Semantic Bug Detection[/bold blue]")
+        console.print("\n[bold magenta]═══ Phase 3: Semantic Bug Detection ═══[/bold magenta]\n")
         from analyzers.static_bug_detector import StaticBugDetector
         static_bug_detector = StaticBugDetector()
         bug_detector = LLMBugDetector(llm_client)
         fix_generator = FixGenerator(llm_client)
+        from rich import box
         
         if 'lang_map' not in locals():
-            lang_map = {'.py': 'python', '.c': 'c', '.cpp': 'cpp', '.h': 'c', '.java': 'java'}
+            lang_map = {'.py': 'python'}
 
-        # Interactive Semantic Analysis Loop
-        from rich.prompt import Prompt
-        from analyzers.fix_generator import FixGenerator
-        
-        # Ensure helper objects are ready
-        fix_gen = FixGenerator(llm_client)
-        if 'struct_analyzer' not in locals():
-            from analyzers.structural_analyzer import StructuralAnalyzer
-            struct_analyzer = StructuralAnalyzer()
+        analysis_files = valid_files if valid_files else files
+        total_bugs_found = 0
+        total_fixes_applied = 0
 
-        # Iterate through files interactively
-        analysis_queue = valid_files if valid_files else files
-        
-        for file_idx, file_path in enumerate(analysis_queue, 1):
-            if file_path.name in ['.gitignore', 'requirements.txt']: continue
-            
-            console.print(f"\n[bold cyan]Analyzing File {file_idx}/{len(analysis_queue)}: {file_path.name}[/bold cyan]")
-            
+        for file_idx, file_path in enumerate(analysis_files, 1):
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     code = f.read()
-            except Exception as e:
-                console.print(f"[red]Error reading {file_path.name}: {e}[/red]")
-                continue
-
-            # Parse file once per session
-            parse_result = struct_analyzer.parser.parse(code, file_path)
-            functions = parse_result.get("functions", [])
-            
-            # Context extraction
-            imports_str = ""
-            global_vars_str = ""
-            parsed_imports = parse_result.get("imports", [])
-            if parsed_imports:
-                imp_lines = []
-                for imp in parsed_imports:
-                    if isinstance(imp, dict):
-                        mod = imp.get("module", "")
-                        nms = imp.get("names", [])
-                        if nms: imp_lines.append(f"from {mod} import {', '.join(nms)}")
-                        elif mod: imp_lines.append(mod)
-                    else: imp_lines.append(str(imp))
-                imports_str = "\n".join(imp_lines)
-            
-            parsed_globals = parse_result.get("global_vars", [])
-            if parsed_globals:
-                global_vars_str = "\n".join(parsed_globals)
-            
-            language = lang_map.get(file_path.suffix, 'python')
-            skip_file = False
-
-            # 1. Globals Analysis
-            if global_vars_str:
-                global_bugs = await bug_detector.analyze_symbol(
-                    "Global Variables", global_vars_str, language, file_path,
-                    class_context="", dependency_hints="", 
-                    global_vars="", imports_list=imports_str
-                )
                 
-                global_priority_bugs = [b for b in global_bugs if b.severity.lower() in ['critical', 'high', 'medium', 'low']]
-                if global_priority_bugs:
-                     for bug in global_priority_bugs:
-                         console.print("\n" + "─"*50)
-                         console.print(f"[bold red]BUG DETECTED[/bold red] in [cyan]Global Variables[/cyan]")
-                         console.print(f"[red]Issue:[/red] {bug.description}")
-                         console.print(f"[green]Suggestion:[/green] {bug.suggestion}")
-                         if bug.code_patch:
-                            console.print(Panel(Syntax(bug.code_patch, language, theme="monokai", line_numbers=True), title="PROPOSED FIX", border_style="blue"))
-                     
-                     action = Prompt.ask("\n[bold]Next [[white]Enter[/white]=Next, [white]s[/white]=Skip File][/bold]", choices=["", "s"], default="")
-                     if action == "s":
-                         continue
-                else:
-                    console.print(f"  [green]✓ No major bugs found in Global Variables.[/green]")
-
-            # 2. Global Code Analysis (Fallback for top-level code)
-            significant_top_level = False
-            if parse_result.get("calls") and len(parse_result.get("calls", [])) > 0:
-                significant_top_level = True
-            
-            if significant_top_level:
-                console.print(f"  [dim]Auditing: Global/Top-level Code...[/dim]")
-                file_bugs = await bug_detector.analyze_code(file_path, code, language)
-                filter_file_bugs = [b for b in file_bugs if b.severity.lower() in ['critical', 'high', 'medium', 'low']]
+                language = lang_map.get(file_path.suffix, 'python')
+                file_bugs_count = 0
                 
-                if filter_file_bugs:
-                    for bug in filter_file_bugs:
-                        console.print("\n" + "─"*50)
-                        console.print(f"[bold red]BUG DETECTED[/bold red] in [cyan]Global Code[/cyan]")
-                        console.print(f"[red]Issue:[/red] {bug.description}")
-                        console.print(f"[green]Suggestion:[/green] {bug.suggestion}")
-                        if bug.code_patch:
-                            console.print(Panel(Syntax(bug.code_patch, language, theme="monokai", line_numbers=True), title="PROPOSED FIX", border_style="blue"))
+                # 1. Static Bug Detection (silent — collected for report)
+                if file_path.suffix == '.py':
+                    static_issues = static_bug_detector.analyze_file(file_path)
+                    for issue in static_issues:
+                        bugs.append({
+                            "file": str(file_path),
+                            "type": "static_logic_bug",
+                            "severity": "critical",
+                            "line": issue["line"],
+                            "description": issue["message"],
+                            "suggestion": "Define variable or fix reference."
+                        })
+                
+                # 2. Context-Aware Function-by-Function Analysis
+                if symbol_table and len(file_symbols := symbol_table.get_symbols_in_file(file_path)) > 0:
+                    # Count analyzable symbols (functions + classes)
+                    func_symbols = [s for s in file_symbols if s.type == SymbolType.FUNCTION]
+                    class_symbols = [s for s in file_symbols if s.type == SymbolType.CLASS]
+                    total_symbols = len(func_symbols) + len(class_symbols)
                     
-                    action = Prompt.ask("\n[bold]Next [[white]Enter[/white]=Next, [white]s[/white]=Skip File][/bold]", choices=["", "s"], default="")
-                    if action == "s":
-                        continue
-                else:
-                    console.print(f"  [green]✓ No major bugs found in Global Code.[/green]")
-
-            # 2. Sequential Function Analysis
-            for target_func in functions:
-                sym_name = target_func['name']
-                
-                # Build Context (Identical logic as before)
-                class_ctx = ""
-                if target_func.get("parent_class"):
-                    cls_name = target_func["parent_class"]
-                    cls_data = next((c for c in parse_result.get("classes", []) if c["name"] == cls_name), None)
-                    if cls_data:
-                        skel = [f"class {cls_name} {{"]
-                        if cls_data.get("attributes"):
-                            for a in cls_data["attributes"]: skel.append(f"    {a};")
-                        skel.append(f"    // ... other methods ...")
-                        skel.append(f"    // === TARGET: {sym_name} ===")
-                        for l in target_func["body_code"].splitlines():
-                            skel.append(f"    {l}")
-                        skel.append("}")
-                        class_ctx = "\n".join(skel)
-
-                dep_hints = ""
-                if target_func.get("calls"):
-                    dep_hints += "Functions this calls: " + ", ".join(target_func["calls"]) + "\n"
-
-                # LLM Analysis
-                console.print(f"  [dim]Auditing: {sym_name}...[/dim]")
-                bugs = await bug_detector.analyze_symbol(
-                    sym_name, target_func["body_code"], language, file_path,
-                    class_context=class_ctx, dependency_hints=dep_hints,
-                    global_vars=global_vars_str, imports_list=imports_str
-                )
-                
-                priority_bugs = [b for b in bugs if b.severity.lower() in ['critical', 'high', 'medium', 'low']]
-                
-                if priority_bugs:
-                    for bug in priority_bugs:
-                        console.print("\n" + "─"*50)
-                        console.print(f"[bold red]BUG DETECTED[/bold red] in [cyan]{sym_name}[/cyan]")
-                        console.print(f"[red]Issue:[/red] {bug.description}")
-                        console.print(f"[green]Suggestion:[/green] {bug.suggestion}")
+                    # ── File Header ──
+                    console.print(Panel(
+                        f"[bold white]{file_path.name}[/bold white]\n"
+                        f"[dim]{file_path}[/dim]\n"
+                        f"[cyan]{len(func_symbols)} functions[/cyan], [cyan]{len(class_symbols)} classes[/cyan]",
+                        title=f"[bold yellow]📄 File {file_idx}/{len(analysis_files)}[/bold yellow]",
+                        border_style="yellow",
+                        box=box.DOUBLE
+                    ))
+                    
+                    # Extract Module-Level Context (once per file)
+                    import ast
+                    global_vars_str = ""
+                    imports_str = ""
+                    try:
+                        tree = ast.parse(code)
+                        imports = []
+                        for node in ast.walk(tree):
+                            if isinstance(node, ast.Import):
+                                for alias in node.names:
+                                    imports.append(f"import {alias.name}" + (f" as {alias.asname}" if alias.asname else ""))
+                            elif isinstance(node, ast.ImportFrom):
+                                module = node.module or ""
+                                names = ", ".join([alias.name + (f" as {alias.asname}" if alias.asname else "") for alias in node.names])
+                                imports.append(f"from {module} import {names}")
+                        imports_str = "\n".join(imports)
                         
-                        # Show integrated AI code patch
-                        if bug.code_patch:
-                            console.print(Panel(
-                                Syntax(bug.code_patch, language, theme="monokai", line_numbers=True),
-                                title=f"[bold blue]PROPOSED FIX for {sym_name}[/bold blue]", 
-                                border_style="blue"
-                            ))
-                else:
-                    console.print(f"  [green]✓ No major bugs found in {sym_name}.[/green]")
+                        globals_list = []
+                        for node in tree.body:
+                            if isinstance(node, ast.Assign):
+                                for target in node.targets:
+                                    if isinstance(target, ast.Name):
+                                        try:
+                                            val_str = ast.unparse(node.value) if hasattr(ast, 'unparse') else "..."
+                                        except:
+                                            val_str = "..."
+                                        globals_list.append(f"{target.id} = {val_str}")
+                        global_vars_str = "\n".join(globals_list)
+                    except:
+                        pass
                     
-                action = Prompt.ask("\n[bold]Next [[white]Enter[/white]=Next, [white]s[/white]=Skip File][/bold]", choices=["", "s"], default="")
-                if action == "s":
-                    skip_file = True
-                    break
-            
-            if skip_file:
-                continue
+                    # ── Analyze each symbol one-by-one ──
+                    sym_index = 0
+                    all_symbols = func_symbols + class_symbols
+                    
+                    for sym in all_symbols:
+                        sym_index += 1
+                        sym_label = "function" if sym.type == SymbolType.FUNCTION else "class"
+                        parent_label = f" ({sym.parent_name})" if sym.parent_name else ""
+                        
+                        console.print(f"\n  [bold cyan]🔍 [{sym_index}/{total_symbols}] Analyzing {sym_label}: [white]{sym.name}[/white]{parent_label}[/bold cyan]")
+                        
+                        # Build context for this symbol
+                        class_ctx = ""
+                        dep_hints = ""
+                        
+                        if sym.type == SymbolType.FUNCTION:
+                            # Class context
+                            if sym.parent_name:
+                                class_syms = [s for s in file_symbols if s.name == sym.parent_name and s.type == SymbolType.CLASS]
+                                if class_syms:
+                                    cls = class_syms[0]
+                                    other_methods = [s.signature for s in file_symbols if s.parent_name == sym.parent_name and s.name != sym.name]
+                                    class_ctx = f"Class: {cls.name}\nAttributes: {', '.join(cls.attributes)}\nOther methods: {', '.join(other_methods)}"
+                            
+                            # Dependency hints
+                            sym_data = next((f for f in parsed_files[file_path]["functions"] if f["qualified_name"].endswith(f".{sym.name}")), None)
+                            if sym_data:
+                                for call in sym_data.get("calls", []):
+                                    all_syms_found = symbol_table.find_symbols_by_name(call)
+                                    for ext in all_syms_found[:3]:
+                                        if ext.qualified_name != sym.qualified_name:
+                                            location = "cross-file" if ext.file != file_path else "same-file"
+                                            dep_hints += f"- {ext.qualified_name} ({location}): {ext.signature}\n"
+                        
+                        # LLM Analysis for this single symbol
+                        sym_bugs = await bug_detector.analyze_symbol(
+                            sym.name, sym.body_code, language, file_path,
+                            class_context=class_ctx,
+                            dependency_hints=dep_hints,
+                            global_vars=global_vars_str, imports_list=imports_str,
+                            verbose=verbose
+                        )
+                        
+                        if not sym_bugs:
+                            console.print(f"  [green]  ✅ No issues found in {sym.name}[/green]")
+                        else:
+                            file_bugs_count += len(sym_bugs)
+                            
+                            # Collect all bugs for report
+                            for bug in sym_bugs:
+                                bugs.append({
+                                    "file": str(file_path),
+                                    "type": bug.type,
+                                    "severity": bug.severity,
+                                    "line": bug.line,
+                                    "description": bug.description,
+                                    "suggestion": bug.suggestion
+                                })
+                            
+                            # ── Show ALL bugs for this function in one panel ──
+                            bug_entries = []
+                            combined_description = []
+                            combined_suggestion = []
+                            for i, bug in enumerate(sym_bugs, 1):
+                                bug_entries.append(
+                                    f"[bold red]{i}. [{bug.severity.upper()}] {bug.type.replace('_', ' ').title()}[/bold red]\n"
+                                    f"   Line {bug.line}: {bug.description}\n"
+                                    f"   [green]Fix:[/green] {bug.suggestion}"
+                                )
+                                combined_description.append(f"{i}. (Line {bug.line}) {bug.description}")
+                                combined_suggestion.append(f"{i}. {bug.suggestion}")
+                            
+                            bug_panel_content = Group(
+                                Markdown(f"### {len(sym_bugs)} issue(s) found in `{sym.name}()`"),
+                                *[f"\n{entry}" for entry in bug_entries]
+                            )
+                            console.print(Panel(bug_panel_content, title=f"[bold red]🐛 BUGS in {sym.name}()[/bold red]", border_style="red"))
+                            
+                            # ── Generate ONE combined patch for all bugs ──
+                            if generate_fixes:
+                                global_context = syntax_fix_generator._extract_global_context(code)
+                                all_desc = "\n".join(combined_description)
+                                all_sugg = "\n".join(combined_suggestion)
+                                
+                                # Pass the function's body code, not the entire file
+                                func_code = sym.body_code if sym.body_code else code
+                                
+                                console.print(f"  [cyan]⚡ Generating combined patch for {len(sym_bugs)} issue(s)...[/cyan]")
+                                fix = await fix_generator.generate_fix(
+                                    "multiple_bugs", "high", file_path, sym_bugs[0].line,
+                                    func_code, language, all_desc, all_sugg, global_context
+                                )
+                                
+                                if fix:
+                                    # Show the COMPLETE corrected function code
+                                    fix_info = Group(
+                                        Markdown(f"### Corrected `{sym.name}()` — {len(sym_bugs)} bug(s) fixed"),
+                                        Syntax(fix.fixed_code, language, theme="monokai", line_numbers=True),
+                                        f"\n[bold blue]Explanation:[/bold blue] {fix.explanation}"
+                                    )
+                                    console.print(Panel(
+                                        fix_info,
+                                        title="[bold blue]PROPOSED FIX[/bold blue]",
+                                        border_style="blue",
+                                        box=box.ROUNDED
+                                    ))
+                                else:
+                                    console.print(f"  [yellow]✗ LLM could not generate a valid fix.[/yellow]")
+                        
+                        # ── Wait for user before moving to next function ──
+                        if sym_index < total_symbols:
+                            input("\n  Press Enter to continue to next function...")
+                
+                else:
+                    # Fallback: no symbol table, analyze whole file
+                    console.print(Panel(
+                        f"[bold white]{file_path.name}[/bold white] [dim](whole-file analysis)[/dim]",
+                        title=f"[bold yellow]📄 File {file_idx}/{len(analysis_files)}[/bold yellow]",
+                        border_style="yellow"
+                    ))
+                    
+                    detected_bugs = await bug_detector.analyze_code(file_path, code, language, verbose=verbose)
+                    file_bugs_count = len(detected_bugs)
+                    
+                    for bug in detected_bugs:
+                        bugs.append({
+                            "file": str(file_path),
+                            "type": bug.type,
+                            "severity": bug.severity,
+                            "line": bug.line,
+                            "description": bug.description,
+                            "suggestion": bug.suggestion
+                        })
+                        
+                        code_lines = code.splitlines()
+                        start_line = max(0, bug.line - 2)
+                        end_line = min(len(code_lines), bug.line + 1)
+                        snippet = "\n".join(code_lines[start_line:end_line])
+                        
+                        bug_info = Group(
+                            Markdown(f"### {bug.type.replace('_', ' ').title()} ({bug.severity})"),
+                            f"[bold red]Location:[/bold red] {file_path.name}:{bug.line}",
+                            f"[bold red]Issue:[/bold red] {bug.description}",
+                            f"[bold green]Suggestion:[/bold green] {bug.suggestion}",
+                            Syntax(snippet, language, theme="monokai", line_numbers=True, start_line=start_line+1, highlight_lines={bug.line})
+                        )
+                        console.print(Panel(bug_info, title=f"[bold red]🐛 BUG DETECTED[/bold red]", border_style="red"))
+                    
+                    if not detected_bugs:
+                        console.print(f"  [green]✅ No semantic bugs found[/green]")
+                
+                # ── File Completion ──
+                total_bugs_found += file_bugs_count
+                console.print(f"\n{'─'*60}")
+                if file_bugs_count == 0:
+                    console.print(f"[bold green]✓ {file_path.name}: Clean — no semantic bugs[/bold green]")
+                else:
+                    console.print(f"[bold yellow]✓ {file_path.name}: {file_bugs_count} bug(s) found[/bold yellow]")
+                console.print(f"{'─'*60}\n")
+                    
+            except Exception as e:
+                console.print(f"  [red]✗ Error analyzing {file_path.name}: {e}[/red]\n")
         
-        console.print("[bold green]Semantic Analysis Complete.[/bold green]")
-    # Phase 4: Redundancy Detection
+        console.print(f"[bold magenta]═══ Semantic Analysis Complete ═══[/bold magenta]")
+        console.print(f"  Total bugs: {total_bugs_found} | Fixes applied: {total_fixes_applied}\n")
+    
+    # ═══════════════════════════════════════════════════════
+    # Phase 5: Redundancy & Duplicate Detection
+    # ═══════════════════════════════════════════════════════
     duplicates = []
     if analysis_mode in ['full', 'redundancy']:
-        console.print("\n[bold blue]Phase 4: Cross-file Redundancy Detection[/bold blue]")
+        console.print("\n[bold magenta]Phase 5: Redundancy & Duplicate Detection[/bold magenta]\n")
         if symbol_table:
             redundancy_detector = CrossFileRedundancyDetector(symbol_table, llm_client)
-            duplicates = await redundancy_detector.detect_duplicates()
-            console.print(f"✓ Found {len(duplicates)} duplicate function groups\n")
+            duplicates = await redundancy_detector.detect_duplicates(console=console)
+            
+            console.print(f"\n[bold yellow]═══ Redundant / Duplicate Functions ═══[/bold yellow]\n")
+            
+            if duplicates:
+                for idx, dup in enumerate(duplicates, 1):
+                    f1, f2 = dup.functions[0], dup.functions[1]
+                    same_file = f1.file == f2.file
+                    scope = "same-file" if same_file else "cross-file"
+                    
+                    console.print(f"  [bold red]#{idx}[/bold red] [bold]{f1.name}[/bold] ↔ [bold]{f2.name}[/bold]  [dim]({scope}, {dup.similarity:.0%} match)[/dim]")
+                    console.print(f"    📄 {f1.file.name}:{f1.line} → [yellow]{f1.name}[/yellow]({f1.signature.split('(')[1] if '(' in f1.signature else ''})")
+                    console.print(f"    📄 {f2.file.name}:{f2.line} → [yellow]{f2.name}[/yellow]({f2.signature.split('(')[1] if '(' in f2.signature else ''})")
+                    console.print(f"    💡 [cyan]{dup.reason}[/cyan]")
+                    if hasattr(dup, 'suggestion') and dup.suggestion:
+                        console.print(f"    🔧 [green]{dup.suggestion}[/green]")
+                    console.print()
+                
+                console.print(f"  [dim]Total: {len(duplicates)} duplicate pair(s) found[/dim]\n")
+            else:
+                console.print("  [green]✓ No redundant or duplicate functions detected.[/green]\n")
         else:
-            console.print("[red]✗ Redundancy detection requires structural analysis first. Skipping.[/red]\n")
+            console.print("[red]  ✗ Redundancy detection requires structural analysis first. Skipping.[/red]\n")
     
-    # Reporting disabled per user request
-    pass
+
+    """
+    # Summary Table
+    table = Table(title="Analysis Summary")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="magenta")
+    
+    table.add_row("Total Files", str(len(files)))
+    table.add_row("Valid Files", str(len(valid_files)))
+    table.add_row("Syntax Errors", str(len(syntax_errors)))
+    table.add_row("Syntax Fixes (vLLM)", str(len(syntax_fixes)))
+    table.add_row("Bugs Found (vLLM)", str(len(bugs)))
+    table.add_row("Bug Fixes Generated", str(len(fixes)))
+    table.add_row("Circular Dependencies", str(len(circular_deps)))
+    table.add_row("Dead Code Functions", str(len(dead_code_symbols)))
+    table.add_row("Duplicate Groups", str(len(duplicates)))
+    
+    console.print(table)
+    """
 
 if __name__ == "__main__":
     app()

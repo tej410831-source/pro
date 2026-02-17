@@ -233,15 +233,8 @@ class SyntaxFixGenerator:
         window_lines = lines[start_line:end_line]
         error_in_window = error_line_idx - start_line
         
-        # Build the code window with error marker
-        code_with_marker = []
-        for i, line in enumerate(window_lines):
-            if i == error_in_window:
-                code_with_marker.append(f"{line}  <--- ERROR HERE")
-            else:
-                code_with_marker.append(line)
-        
-        code_window = '\n'.join(code_with_marker)
+        # Send clean code to LLM (NO markers or annotations)
+        code_window = '\n'.join(window_lines)
         
         region = {
             'error': error,
@@ -251,35 +244,29 @@ class SyntaxFixGenerator:
             'error_line_in_region': error_in_window + 1
         }
         
-        # Build MINIMAL, focused prompt
-        prompt = f"""Fix this {language} syntax error:
+        # Build MINIMAL, focused prompt — ask for JUST the fixed line
+        broken_line = window_lines[error_in_window].rstrip()
+        
+        prompt = f"""Fix this {language} syntax error.
 
-ERROR at Line {error.line}: {error.message}
+Error: {error.message}
 
-CODE WINDOW (Lines {region['start_line']}-{region['end_line']}):
+This is the broken line:
+{broken_line}
+
+Here is the surrounding code for context:
 {code_window}
 
-TASK: Return the EXACT same code with ONLY the syntax error fixed.
+Reply with ONLY the corrected line and a short explanation, like this:
 
-CRITICAL RULES:
-1. Return ALL {len(window_lines)} lines from the code window
-2. Change ONLY what's needed to fix the syntax error
-3. Do NOT add comments like "# ERROR fixed" - FIX SILENTLY
-4. Do NOT use placeholders like "..." or "// rest of code"
-5. PRESERVE all existing code exactly as-is except for the minimal syntax fix
-
-XML FORMAT:
 <FIX>
 <CODE>
-[All {len(window_lines)} lines with minimal syntax fix applied]
+class Foo:
 </CODE>
-<EXPLANATION>[What single change was made]</EXPLANATION>
+<EXPLANATION>Added missing colon</EXPLANATION>
 </FIX>
 
-EXAMPLE:
-If line has: "class Foo {{" (missing closing brace)
-Fix to: "class Foo {{}}" (add closing brace)
-Return ALL lines, not just the changed one.
+Now fix the broken line. Output ONLY the single corrected line:
 """
         
         if verbose:
@@ -288,17 +275,30 @@ Return ALL lines, not just the changed one.
         try:
             response = await self.llm_client.generate_completion(prompt, temperature=0.1)
             
-            # Try XML then markdown
-            response_data = extract_xml_fixes(response)
-            if not response_data:
-                response_data = extract_code_from_markdown(response, num_regions=1)
+            fixed_code, explanation = self._parse_fix_response(response)
             
-            if not response_data or not response_data.get('fixes'):
-                raise ValueError("Could not parse LLM response")
+            # Validate: reject placeholder/template text echoed by LLM
+            if not fixed_code or self._is_placeholder_text(fixed_code, 1):
+                # Retry once with higher temperature
+                response = await self.llm_client.generate_completion(prompt, temperature=0.5)
+                fixed_code, explanation = self._parse_fix_response(response)
+                
+                if not fixed_code or self._is_placeholder_text(fixed_code, 1):
+                    raise ValueError("LLM returned placeholder text instead of actual code")
             
-            fix = response_data['fixes'][0]
-            fixed_code = fix['fixed_code']
-            explanation = fix.get('explanation', 'Fixed syntax error.')
+            # The LLM returns the corrected line(s) — reconstruct the full window
+            fixed_lines = fixed_code.strip().splitlines()
+            
+            # Replace the broken line(s) in the window with the fix
+            reconstructed = list(window_lines)
+            if len(fixed_lines) == 1:
+                # Single line fix — replace just the error line
+                reconstructed[error_in_window] = fixed_lines[0]
+            else:
+                # Multi-line fix — replace around the error line
+                reconstructed[error_in_window:error_in_window + 1] = fixed_lines
+            
+            fixed_code = '\n'.join(reconstructed)
             
             # Apply context-aware indentation
             expected_indent = self._get_expected_base_indent(code, region)
@@ -318,6 +318,50 @@ Return ALL lines, not just the changed one.
                 'region': region
             }
     
+    def _parse_fix_response(self, response: str):
+        """Parse LLM response into fixed_code and explanation."""
+        response_data = extract_xml_fixes(response)
+        if not response_data:
+            response_data = extract_code_from_markdown(response, num_regions=1)
+        
+        if not response_data or not response_data.get('fixes'):
+            return None, 'Fixed syntax error.'
+        
+        fix = response_data['fixes'][0]
+        return fix.get('fixed_code', ''), fix.get('explanation', 'Fixed syntax error.')
+    
+    def _is_placeholder_text(self, code: str, expected_lines: int) -> bool:
+        """
+        Check if LLM returned template/placeholder text instead of real code.
+        Returns True if the code looks like echoed template text.
+        """
+        stripped = code.strip()
+        
+        # Check for bracket-enclosed placeholder patterns
+        if stripped.startswith('[') and stripped.endswith(']') and stripped.count('\n') == 0:
+            return True
+        
+        # Check for common placeholder phrases
+        placeholder_phrases = [
+            'lines with minimal syntax fix',
+            'paste all',
+            'lines here with the fix',
+            'What single change was made',
+            '<--- ERROR',
+            'ERROR HERE',
+            'lines with the syntax fix applied',
+        ]
+        for phrase in placeholder_phrases:
+            if phrase.lower() in stripped.lower():
+                return True
+        
+        # If the code has far fewer lines than expected, it's suspicious
+        actual_lines = len(stripped.splitlines())
+        if expected_lines > 3 and actual_lines <= 1:
+            return True
+        
+        return False
+
     def apply_patch_to_code(self, original_code: str, region: Dict, fixed_code: str) -> str:
         """
         Replace region in original_code with fixed_code.
@@ -438,6 +482,14 @@ Return ALL lines, not just the changed one.
         lines = full_code.split('\n')
         region_start = region['start_line'] - 1  # 0-indexed
         
+        # Determine the indentation of the error region itself
+        # Look at the first non-empty line in the region to gauge current indent
+        region_indent = 0
+        for idx in range(region_start, min(len(lines), region_start + 5)):
+            if lines[idx].strip():
+                region_indent = len(lines[idx]) - len(lines[idx].lstrip())
+                break
+        
         # Scan backwards from region start to find parent block
         for i in range(region_start - 1, -1, -1):
             line = lines[i].rstrip()
@@ -452,11 +504,20 @@ Return ALL lines, not just the changed one.
                 stripped.startswith('template') or  # C++ templates
                 'class ' in stripped):  # Java/C++ classes
                 
-                # Found parent - calculate its indent
+                # Found a def/class - calculate its indent
                 parent_indent = len(line) - len(stripped)
+                child_indent = parent_indent + 4
                 
-                # Child elements are indented +4 from parent
-                return parent_indent + 4
+                # Only treat as parent if the error region is actually
+                # INSIDE this block (i.e., indented deeper than the parent).
+                # If the region's indent is <= the parent's indent, then
+                # the error is at the same level or outside — not a child.
+                if region_indent > parent_indent:
+                    return child_indent
+                else:
+                    # This def/class is NOT enclosing the error region.
+                    # The error is at top-level or same level — return 0.
+                    return 0
         
         # No parent found - this is top-level code
         return 0

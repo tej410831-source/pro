@@ -82,7 +82,7 @@ class FixGenerator:
 
         return f"""You are an expert senior {language} engineer.
 {context_section}
-**Target Bug:**
+**Target Bug(s):**
 - Type: {bug_type}
 - Line: {line}
 - Issue: {description}
@@ -94,15 +94,16 @@ class FixGenerator:
 ```
 
 **Task:**
-1. Fix the bug in the provided source code.
-2. IMPORTANT: Return the **full and complete** source code in the `fixed_code` field.
-3. Keep all other logic intact.
-4. Ensure the JSON is valid. If your `fixed_code` contains double quotes, escape them as `\"`.
+1. Fix ALL the bugs listed above in the source code.
+2. Return the **complete corrected function/class code** in the `fixed_code` field.
+3. Include the FULL function from its `def` or `class` line to its last line — do NOT truncate.
+4. Keep all other logic intact — only fix the specific bugs mentioned.
+5. Ensure the JSON is valid. Escape double quotes as `\\"` inside `fixed_code`.
 
 Respond with ONLY valid JSON:
 {{
-  "fixed_code": "<full source code with fix applied>",
-  "explanation": "<brief summary of change>"
+  "fixed_code": "<complete corrected function code>",
+  "explanation": "<brief summary of all changes made>"
 }}"""
     
     def generate_unified_diff(

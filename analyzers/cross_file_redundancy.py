@@ -21,54 +21,76 @@ class CrossFileRedundancyDetector:
     2. Semantic Verify (LLM): Ask AI if logic is truly identical.
     """
     
+    # Dunder methods to skip — these are boilerplate and naturally similar across classes
+    SKIP_METHODS = {
+        '__init__', '__str__', '__repr__', '__eq__', '__ne__', '__lt__', '__gt__',
+        '__le__', '__ge__', '__hash__', '__len__', '__bool__', '__del__',
+        '__enter__', '__exit__', '__iter__', '__next__', '__getitem__', '__setitem__',
+        '__contains__', '__call__', '__new__', '__setattr__', '__getattr__',
+    }
+    
+    MIN_BODY_LINES = 4  # Minimum function body lines to consider
+    AST_SIMILARITY_THRESHOLD = 0.85  # Minimum AST fingerprint similarity
+    
     def __init__(self, symbol_table, llm_client=None):
         self.symbol_table = symbol_table
         self.llm_client = llm_client
         from rich.console import Console
         self.console = Console()
     
-    async def detect_duplicates(self) -> List[DuplicateFunction]:
+    async def detect_duplicates(self, console=None) -> List[DuplicateFunction]:
         duplicates = []
-        # Filter for functions and classes that have bodies
-        candidates = [s for s in self.symbol_table.symbols.values() 
-                     if s.type in (SymbolType.FUNCTION, SymbolType.CLASS) and s.body_code]
+        
+        # PRE-CHECK: Detect exact duplicate definitions (same name, same file)
+        # The symbol table deduplicates by name, so we scan the raw AST
+        seen_files = set()
+        for sym in self.symbol_table.symbols.values():
+            if sym.file not in seen_files:
+                seen_files.add(sym.file)
+        
+        for file_path in seen_files:
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    source = f.read()
+                tree = ast.parse(source)
+                exact_dups = self._find_duplicate_defs(tree, file_path, source)
+                if exact_dups:
+                    duplicates.extend(exact_dups)
+                    if console:
+                        for dup in exact_dups:
+                            f1, f2 = dup.functions
+                            console.print(f"  [red]⚠ Exact duplicate definition: {f1.name}() defined at lines {f1.line} AND {f2.line} in {file_path.name}[/red]")
+            except:
+                pass
+        
+        # Filter: only real logic functions (no dunders, no trivially small)
+        functions = [
+            s for s in self.symbol_table.symbols.values() 
+            if s.type == SymbolType.FUNCTION 
+            and s.body_code
+            and len(s.body_code.strip().splitlines()) >= self.MIN_BODY_LINES
+            and s.name not in self.SKIP_METHODS
+        ]
+        
+        if console:
+            console.print(f"  [dim]Comparing {len(functions)} functions for similarity (skipped dunder methods)...[/dim]")
         
         # 1. Structural Fingerprinting (The Filter)
-        fingerprints: Dict[str, str] = {}
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TimeRemainingColumn()
-        ) as progress:
-            task1 = progress.add_task("[cyan]Fingerprinting functions...", total=len(candidates))
-            
-            for symbol in candidates:
-                progress.update(task1, advance=1, description=f"[cyan]Fingerprinting {symbol.name} ({symbol.file.name})")
-                fp = self._get_universal_fingerprint(symbol.body_code, symbol.file.suffix.lower())
-                if len(fp) > 5: # Ignore trivial bodies
-                    fingerprints[symbol.qualified_name] = fp
+        fingerprints = {}
+        for func in functions:
+            try:
+                fingerprints[func.qualified_name] = self._get_structural_fingerprint(func.body_code)
+            except:
+                fingerprints[func.qualified_name] = ""
 
-        # 2. Optimized Comparison (Bucket by length or hash to avoid O(N^2))
-        # For now, we'll sort by length and only compare neighbors, or plain O(N^2) if N is small.
-        # Let's simple O(N^2) but with a quick hash check.
-        
-        sorted_keys = sorted(fingerprints.keys(), key=lambda k: len(fingerprints[k]))
-        
-        checked: set = set()
-        
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TimeRemainingColumn()
-        ) as progress:
-            task2 = progress.add_task("[cyan]Comparing functions...", total=len(sorted_keys))
-            
-            for i, name1 in enumerate(sorted_keys):
-                progress.update(task2, advance=1, description=f"[cyan]Comparing {name1}")
-                fp1 = fingerprints[name1]
-                sym1 = self.symbol_table.symbols[name1]
+        # 2. Compare All Candidate Pairs (same-file AND cross-file)
+        for i, func1 in enumerate(functions):
+            for func2 in functions[i+1:]:
+                
+                # Skip comparing methods of the same class (e.g. get vs set)
+                if (func1.parent_name and func2.parent_name 
+                    and func1.parent_name == func2.parent_name):
+                    continue
                 
                 # Check a window of neighbors with similar complexity
                 # (Simplification: check all for now, N is likely < 100 in tests. 
@@ -77,51 +99,42 @@ class CrossFileRedundancyDetector:
                     if name1 == name2: continue
                     sym2 = self.symbol_table.symbols[name2]
                     
-                    # Check 1: Must be same Symbol Type (Function vs Function)
-                    if sym1.type != sym2.type:
-                        continue
-    
-                    fp2 = fingerprints[name2]
+                # Structural Similarity (Sequence Match on Node Types)
+                struct_sim = difflib.SequenceMatcher(None, fp1, fp2).ratio()
+                
+                if struct_sim > self.AST_SIMILARITY_THRESHOLD:
+                    # 3. AI Verification (The Judge)
+                    if console:
+                        same_or_cross = "same-file" if func1.file == func2.file else "cross-file"
+                        console.print(f"  [cyan]🔍 Candidate ({same_or_cross}): {func1.name} ↔ {func2.name} (AST: {struct_sim:.0%})[/cyan]")
                     
-                    # Optimization: Length diff check
-                    if abs(len(fp1) - len(fp2)) / max(len(fp1), len(fp2)) > 0.3:
-                        continue # Too different in size
+                    is_semantic_duplicate = False
+                    reason = f"Structurally similar (AST match: {struct_sim:.2f})"
+                    suggestion = ""
                     
-                    # Check 2: Structural Similarity
-                    struct_sim = difflib.SequenceMatcher(None, fp1, fp2).ratio()
-                    
-                    # print(f"DEBUG SIMILARITY {name1} vs {name2}: {struct_sim:.2f}") # Debug
-                    
-                    if struct_sim > 0.75: # Slightly relaxed for better recall
-                        # Found a candidate! It has the same "shape" of logic.
+                    if self.llm_client:
+                        llm_result = await self.validate_with_llm(func1, func2)
+                        is_semantic_duplicate = llm_result.get("are_duplicates", False)
+                        if is_semantic_duplicate:
+                            reason = llm_result.get("shared_logic_summary", "Same logic")
+                            suggestion = llm_result.get("optimization_suggestion", "")
+                    else:
+                        is_semantic_duplicate = True
                         
-                        # Show user we are checking this pair using progress console to avoid UI break
-                        progress.console.print(f"  [yellow]?[/yellow] Candidate: [cyan]{sym1.name}[/cyan] vs [cyan]{sym2.name}[/cyan] (Sim: {struct_sim:.2f}) -> Asking AI...")
-                        
-                        if self.llm_client:
-                            llm_result = await self.validate_with_llm(sym1, sym2)
-                            
-                            # print(f"DEBUG LLM: {llm_result}") # Debug
-                            
-                            if llm_result.get("are_duplicates", False):
-                                # Immediate feedback to user
-                                progress.console.print(f"[bold green]✓ DUPLICATE CONFIRMED![/bold green]")
-                                progress.console.print(f"  • Reason: {llm_result.get('shared_logic_summary', 'Same logic')}\n")
-
-                                duplicates.append(DuplicateFunction(
-                                    functions=[sym1, sym2],
-                                    similarity=struct_sim,
-                                    reason=f"AI Confirmed: {llm_result.get('shared_logic_summary', 'Same logic')}"
-                                ))
-                            else:
-                                progress.console.print(f"  [dim]x AI rejected (Different logic)[/dim]")
-                        else:
-                            duplicates.append(DuplicateFunction(
-                                functions=[sym1, sym2],
-                                similarity=struct_sim,
-                                reason=f"Structurally identical ({struct_sim:.2f})"
-                            ))
-
+                    if is_semantic_duplicate:
+                        dup = DuplicateFunction(
+                            functions=[func1, func2],
+                            similarity=struct_sim,
+                            reason=reason
+                        )
+                        dup.suggestion = suggestion
+                        duplicates.append(dup)
+                        if console:
+                            console.print(f"    [red]⚠ Confirmed duplicate![/red]")
+                    else:
+                        if console:
+                            console.print(f"    [green]✓ Not a duplicate[/green]")
+        
         return duplicates
 
     def _get_universal_fingerprint(self, code: str, extension: str) -> str:
@@ -152,73 +165,148 @@ class CrossFileRedundancyDetector:
         except:
             return ""
 
-    def _get_c_java_fingerprint(self, code: str) -> str:
-        # Regex to capture control flow keywords, braces, and operators
-        # Keywords: if, else, for, while, do, switch, case, return, break, continue, try, catch, throw
-        # Operators: +, -, *, /, %, <, >, =, !, &, |, ^
-        token_pattern = re.compile(
-            r'\b(if|else|for|while|do|switch|case|return|break|continue|try|catch|throw)\b'
-            r'|[{}]'
-            r'|([+\-*/%<>!=&|^]=?)'
-        )
-        
-        # findall returns tuples if there are multiple groups, we want to flatten
-        raw_tokens = token_pattern.findall(code)
-        tokens = []
-        for t in raw_tokens:
-            if isinstance(t, tuple):
-                tokens.extend([x for x in t if x])
-            else:
-                tokens.append(t)
-        return " ".join(tokens)
-
-    async def validate_with_llm(self, sym1: Symbol, sym2: Symbol) -> Dict[str, Any]:
+    def _find_duplicate_defs(self, tree, file_path, source: str) -> List[DuplicateFunction]:
         """
-        The "AI Judge": Confirms if logic is identical.
+        Scan a file's AST to find functions defined multiple times with the same name
+        at the same scope (top-level or within the same class).
+        This catches cases the symbol table misses due to key deduplication.
+        """
+        from pathlib import Path
+        duplicates = []
+        source_lines = source.splitlines()
+        
+        # Collect all function defs at each scope
+        # scope_key -> list of (name, lineno, end_lineno)
+        scopes = {}
+        
+        # Top-level functions
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                key = ("top", node.name)
+                if key not in scopes:
+                    scopes[key] = []
+                scopes[key].append(node)
+            
+            # Functions inside classes
+            elif isinstance(node, ast.ClassDef):
+                for item in node.body:
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        key = (node.name, item.name)
+                        if key not in scopes:
+                            scopes[key] = []
+                        scopes[key].append(item)
+        
+        # Find names defined more than once at same scope
+        for (scope, name), nodes in scopes.items():
+            if len(nodes) < 2:
+                continue
+            
+            # Create pairs for each duplicate
+            for i in range(len(nodes)):
+                for j in range(i + 1, len(nodes)):
+                    n1, n2 = nodes[i], nodes[j]
+                    
+                    # Extract body code for each definition
+                    end1 = getattr(n1, 'end_lineno', n1.lineno + 5)
+                    end2 = getattr(n2, 'end_lineno', n2.lineno + 5)
+                    body1 = "\n".join(source_lines[n1.lineno - 1:end1])
+                    body2 = "\n".join(source_lines[n2.lineno - 1:end2])
+                    
+                    # Create lightweight Symbol-like objects
+                    parent = scope if scope != "top" else None
+                    sym1 = Symbol(name=name, symbol_type=SymbolType.FUNCTION, file_path=file_path, 
+                                 line=n1.lineno, signature=f"def {name}(...)", body_code=body1,
+                                 parent_name=parent or "")
+                    sym2 = Symbol(name=name, symbol_type=SymbolType.FUNCTION, file_path=file_path,
+                                 line=n2.lineno, signature=f"def {name}(...)", body_code=body2,
+                                 parent_name=parent or "")
+                    
+                    dup = DuplicateFunction(
+                        functions=[sym1, sym2],
+                        similarity=1.0,
+                        reason=f"Exact duplicate: {name}() defined twice in {file_path.name}"
+                    )
+                    dup.suggestion = f"Remove the duplicate definition at line {n2.lineno}"
+                    duplicates.append(dup)
+        
+        return duplicates
+
+    async def validate_with_llm(self, func1: Symbol, func2: Symbol) -> Dict:
+        """
+        The "AI Judge": Confirms if logic is truly identical.
+        Uses a strict prompt to minimize hallucination.
         """
         if not self.llm_client:
             return {"are_duplicates": False}
         
-        prompt = f"""You are a Senior Code Reviewer.
-Compare these two code snippets provided below.
+        prompt = f"""Compare these two Python functions and determine if they do the EXACT SAME THING.
 
-GOAL: Determine if they implement the SAME LOGIC/ALGORITHM.
-Ignore:
-- Variable names
-- Function/Class names
-- Comments/Docstrings
-- Whitespace formatting
-- Syntax differences (if different languages)
-
-Snippet 1 ({sym1.name} in {sym1.file.name}):
-```{sym1.language if hasattr(sym1, 'language') else ''}
-{sym1.body_code}
+Function A — "{func1.name}":
+```
+{func1.body_code}
 ```
 
-Snippet 2 ({sym2.name} in {sym2.file.name}):
-```{sym2.language if hasattr(sym2, 'language') else ''}
-{sym2.body_code}
+Function B — "{func2.name}":
+```
+{func2.body_code}
 ```
 
-Are they semantic duplicates?
-Respond ONLY with valid JSON:
-{{
-  "are_duplicates": boolean,
-  "confidence": float (0.0-1.0),
-  "shared_logic_summary": "Short 1-line description",
-  "optimization_suggestion": "How to consolidate"
-}}"""
+IMPORTANT: Two functions are duplicates ONLY if they perform the same computation/algorithm.
+- Same control flow (same loops, same conditions)
+- Same data transformations (same operations on inputs)
+- Different variable names or function names do NOT matter
+
+They are NOT duplicates if:
+- They operate on different data types
+- They have different logic (even slightly)
+- One has extra steps the other doesn't
+
+Answer with ONLY valid JSON, nothing else:
+{{"are_duplicates": true, "shared_logic_summary": "one line description", "optimization_suggestion": "how to merge them"}}
+or
+{{"are_duplicates": false, "shared_logic_summary": "N/A", "optimization_suggestion": "N/A"}}"""
         
         try:
             import json
+            import re
             response = await self.llm_client.generate_completion(prompt)
-            # Clean possible markdown wrapping
-            if "```json" in response:
-                response = response.split("```json")[1].split("```")[0].strip()
-            elif "```" in response:
-                response = response.split("```")[1].split("```")[0].strip()
+            
+            # Try multiple extraction strategies
+            cleaned = response.strip()
+            
+            # Strategy 1: Extract JSON from markdown code block
+            if "```json" in cleaned:
+                cleaned = cleaned.split("```json")[1].split("```")[0].strip()
+            elif "```" in cleaned:
+                cleaned = cleaned.split("```")[1].split("```")[0].strip()
+            
+            # Strategy 2: Find JSON object with regex
+            json_match = re.search(r'\{[^{}]*"are_duplicates"[^{}]*\}', cleaned, re.DOTALL)
+            if json_match:
+                cleaned = json_match.group(0)
+            
+            # Normalize boolean values (LLM might output True/False instead of true/false)
+            cleaned = cleaned.replace(': True', ': true').replace(': False', ': false')
+            cleaned = cleaned.replace(':True', ':true').replace(':False', ':false')
+            
+            try:
+                result = json.loads(cleaned)
+                return result
+            except json.JSONDecodeError:
+                # Strategy 3: Look for are_duplicates keyword with any format
+                dup_match = re.search(r'"are_duplicates"\s*:\s*(true|false)', cleaned, re.IGNORECASE)
+                if dup_match:
+                    is_dup = dup_match.group(1).lower() == 'true'
+                    summary_match = re.search(r'"shared_logic_summary"\s*:\s*"([^"]*)"', cleaned)
+                    suggestion_match = re.search(r'"optimization_suggestion"\s*:\s*"([^"]*)"', cleaned)
+                    return {
+                        "are_duplicates": is_dup,
+                        "shared_logic_summary": summary_match.group(1) if summary_match else "Same logic detected",
+                        "optimization_suggestion": suggestion_match.group(1) if suggestion_match else "Consolidate into one function"
+                    }
                 
-            return json.loads(response)
+                return {"are_duplicates": False}
+                
         except Exception as e:
-            print(f"LLM Validation Error: {e}")
-            return {"are_duplicates": False, "confidence": 0.0}
+            print(f"LLM Validation Error ({func1.name} vs {func2.name}): {e}")
+            return {"are_duplicates": False}
