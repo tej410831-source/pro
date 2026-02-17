@@ -9,12 +9,13 @@ import json
 from utils.llm_utils import extract_json, robust_json_load
 
 class SemanticBug:
-    def __init__(self, bug_type: str, severity: str, line: int, description: str, suggestion: str):
+    def __init__(self, bug_type: str, severity: str, line: int, description: str, suggestion: str, code_patch: str = ""):
         self.type = bug_type
         self.severity = severity
         self.line = line
         self.description = description
         self.suggestion = suggestion
+        self.code_patch = code_patch
 
 class LLMBugDetector:
     """
@@ -53,7 +54,7 @@ class LLMBugDetector:
             response = await self.llm_client.generate_completion(prompt, temperature=0.1)
             result = robust_json_load(response)
             
-            if not result:
+            if not result or not result.get("issues"):
                 return []
             
             bugs = []
@@ -63,7 +64,8 @@ class LLMBugDetector:
                     severity=issue.get("severity", "medium"),
                     line=issue.get("line", 0),
                     description=issue.get("description", ""),
-                    suggestion=issue.get("suggestion", "")
+                    suggestion=issue.get("suggestion", ""),
+                    code_patch=issue.get("code_patch", "")
                 ))
             return bugs
         except Exception as e:
@@ -95,8 +97,10 @@ class LLMBugDetector:
         if dep_hints:
             dep_section = f"{dep_hints}\n"
 
-        return f"""You are a senior {lang} code auditor.
-Analyze the target code block below and identify ONLY CRITICAL, FUNCTION-BREAKING bugs.
+        return f"""You are a professional {lang} code auditor.
+Your goal is to find real, logical bugs and provide a concrete code patch for each. 
+
+**CRITICAL: BE EXTREMELY PEDANTIC.** If you see something that looks even slightly incorrect, like an unreachable loop, a potential stack overflow, or a "race condition" (even if unlikely), YOU MUST REPORT IT.
 
 **Target File:** {file}
 **Target Symbol:** {name}
@@ -105,27 +109,28 @@ Analyze the target code block below and identify ONLY CRITICAL, FUNCTION-BREAKIN
 {dep_section}
 
 **Focus on:**
-1. DEFINITE crashes (segfaults, exceptions, null pointers).
-2. LOGIC ERRORS that break the core functionality.
-3. CRITICAL security vulnerabilities (e.g. buffer overflows, SQL injection).
-4. DATA CORRUPTION or invalid state.
+1. DEFINITE crashes or runtime errors.
+2. LOGIC ERRORS that break core functionality (including unreachable code).
+3. SECURITY vulnerabilities.
+4. DATA CORRUPTION symptoms.
+5. RACE CONDITIONS or concurrency issues (even if theoretical).
 
-**Do NOT Report:**
-1. Style, formatting, or consistent naming issues.
-2. Minor performance optimizations.
-3. Best practices that don't cause bugs.
-4. Theoretical issues that are unlikely to occur in practice.
-5. Missing documentation.
+**Strict Rules:**
+1. For every bug found, you MUST provide a "code_patch" that fixes the issue.
+2. The code_patch MUST be a complete replacement for the buggy portion of the code.
+3. DO NOT report style, naming, or minor best practice violations.
+4. Respond ONLY with the JSON object.
 
 Respond with a JSON object:
 {{
   "issues": [
     {{
-      "type": "logic_error|security|performance|error_handling",
+      "type": "logic_error|security|performance|error_handling|race_condition",
       "severity": "critical|high|medium|low",
       "line": <line_number>,
-      "description": "<one sentence description>",
-      "suggestion": "<brief fix suggestion>"
+      "description": "<extremely detailed plain-text description of why it is a bug, be pedantic>",
+      "suggestion": "<plain-text description of how to resolve>",
+      "code_patch": "<complete fixed code snippet for this specific issue>"
     }}
   ]
 }}"""
@@ -155,7 +160,8 @@ Respond with a JSON object:
                     severity=issue.get("severity", "medium"),
                     line=issue.get("line", 0),
                     description=issue.get("description", ""),
-                    suggestion=issue.get("suggestion", "")
+                    suggestion=issue.get("suggestion", ""),
+                    code_patch=issue.get("code_patch", "")
                 ))
             return bugs
         except Exception as e:
@@ -164,34 +170,34 @@ Respond with a JSON object:
     
     def _build_detection_prompt(self, file_path: Path, code: str, language: str) -> str:
         return f"""You are a senior {language} code auditor. 
-Analyze the provided code and identify ONLY concrete, actionable bugs. 
+Identify ONLY concrete, actionable logical bugs and provide a code patch for each.
+BE EXTREMELY PEDANTIC. Report anything that breaks logic or creates risks.
 
 **Focus on:**
 1. Potential crashes or runtime errors.
-2. Serious logic flaws that would break the intended functionality.
-3. Obvious security vulnerabilities.
+2. Serious logic flaws (including unreachable code blocks).
+3. Security vulnerabilities.
+4. Concurrency or race conditions.
 
-**Ignore:**
-1. Style or formatting issues.
-2. Missing docstrings or comments.
-3. Minor optimizations unless they are critical.
+**Rules:**
+1. Provide a "code_patch" field for every issue.
+2. No style/formatting issues.
 
 File: {file_path.name}
 ```{language}
 {code}
 ```
 
-Respond with a JSON object containing a list of issues.
+Respond with a JSON object:
 {{
   "issues": [
     {{
-      "type": "logic_error|security|performance|error_handling",
+      "type": "logic_error|security|performance|error_handling|race_condition",
       "severity": "critical|high|medium|low",
       "line": <line_number>,
-      "description": "<one sentence description>",
-      "suggestion": "<brief fix suggestion>"
+      "description": "<plain-text description>",
+      "suggestion": "<plain-text resolution steps>",
+      "code_patch": "<complete fixed code snippet>"
     }}
   ]
 }}"""
-    
-    # _extract_json replaced by utils.llm_utils.extract_json

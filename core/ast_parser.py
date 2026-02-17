@@ -31,19 +31,12 @@ class StructuralParser:
                 if lang_id == 'c':
                     # Simplified C query
                     query_str = """
-                    (function_definition
-                      declarator: (function_declarator
-                        declarator: (identifier) @name
-                        parameters: (parameter_list) @params)
-                    ) @func
-                    
+                    (function_definition) @func
                     (declaration) @var
                     """
                 elif lang_id == 'cpp':
                     query_str = """
-                    (function_definition
-                      declarator: (function_declarator) @func
-                    )
+                    (function_definition) @func
                     
                     (class_specifier
                       name: (type_identifier) @name
@@ -68,7 +61,21 @@ class StructuralParser:
                     """
                 
                 self.queries[lang_id] = lang.query(query_str)
-                self.queries_usage[lang_id] = lang.query("(identifier) @id")
+                self.queries[lang_id] = lang.query(query_str)
+                
+                if lang_id == 'java':
+                    # Java uses 'identifier' or 'type_identifier'
+                    self.queries_usage[lang_id] = lang.query("""
+                    (identifier) @id
+                    (type_identifier) @id
+                    """)
+                else:
+                    # C/C++ usage
+                    self.queries_usage[lang_id] = lang.query("""
+                    (identifier) @id
+                    (type_identifier) @id
+                    (field_identifier) @id
+                    """)
             except Exception as e:
                 print(f"Warning: Failed to initialize Tree-sitter for {lang_id}: {e}")
 
@@ -111,6 +118,29 @@ class StructuralParser:
                 self.classes = []
                 self.imports = []
                 self.calls_in_current = []
+                self.calls_in_current = []
+                self.identifiers = []
+                self.variables = []
+
+            def visit_Name(self, node):
+                if isinstance(node, ast.Name):
+                    self.identifiers.append(node.id)
+                self.generic_visit(node)
+
+            def visit_Assign(self, node):
+                # Only capture top-level variables (not inside function/class)
+                if self.current_function is None and self.current_class is None:
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            self.variables.append({"name": target.id, "line": node.lineno})
+                self.generic_visit(node)
+
+            def visit_AnnAssign(self, node):
+                 # Only capture top-level variables
+                if self.current_function is None and self.current_class is None:
+                    if isinstance(node.target, ast.Name):
+                        self.variables.append({"name": node.target.id, "line": node.lineno})
+                self.generic_visit(node)
 
             def visit_Import(self, node):
                 names = [alias.name for alias in node.names]
@@ -201,7 +231,9 @@ class StructuralParser:
             "functions": analyzer.functions,
             "classes": analyzer.classes,
             "imports": analyzer.imports,
-            "calls": all_calls
+            "calls": all_calls,
+            "identifiers": analyzer.identifiers,
+            "variables": analyzer.variables
         }
 
     def _parse_with_treesitter(self, code: str, lang_id: str) -> Dict[str, Any]:
@@ -256,6 +288,12 @@ class StructuralParser:
                 def get_symbol_name(n):
                     if n.type in ['identifier', 'type_identifier', 'field_identifier', 'destructor_name']:
                         return n.text.decode('utf8')
+                    # Prefer field_identifier for methods if available
+                    field = n.child_by_field_name('name') or n.child_by_field_name('declarator')
+                    if field:
+                        res = get_symbol_name(field)
+                        if res: return res
+                        
                     # Scoped identifiers (A::B)
                     if n.type == 'scoped_identifier':
                         return n.text.decode('utf8')

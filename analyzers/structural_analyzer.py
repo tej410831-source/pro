@@ -22,7 +22,7 @@ class StructuralAnalyzer:
 
     def analyze_codebase(self, files: List[Path]) -> Dict[str, Any]:
         """Run full structural analysis on a list of files."""
-        print(f"Phase 4: Analyzing {len(files)} files structurally...")
+        print(f"Analysing {len(files)} files structurally...")
         
         all_identifiers_global = [] 
         
@@ -113,6 +113,9 @@ class StructuralAnalyzer:
             if sym.type == STSymbolType.FUNCTION:
                 if sym.name.lower() in ['main', '__init__', '__main__']:
                     sym.is_used = True
+                elif sym.parent_name and (sym.name == sym.parent_name or sym.name == f"~{sym.parent_name}"):
+                    # C++/Java Constructors and Destructors
+                    sym.is_used = True
                 elif sym.name in called_names:
                     sym.is_used = True
                 else:
@@ -123,6 +126,18 @@ class StructuralAnalyzer:
                 count = all_identifiers_global.count(sym.name)
                 # Count > 1 means it appeared somewhere else in addition to declaration
                 sym.is_used = (count > 1 or sym.name.startswith("_"))
+
+            elif sym.type == STSymbolType.CLASS:
+                # Class usage: if name appears in identifiers (instantiation, inheritance, type hint)
+                count = all_identifiers_global.count(sym.name)
+                
+                # Language-specific threshold
+                # Python AST does NOT add class definition name to 'identifiers' list -> Threshold > 0
+                # Tree-sitter (C++/Java) logic ADDS definition name to 'identifiers' list -> Threshold > 1
+                if sym.file and str(sym.file).endswith('.py'):
+                    sym.is_used = (count > 0)
+                else:
+                    sym.is_used = (count > 1)
 
         # 3. Detect Cycles
         import_cycles = []

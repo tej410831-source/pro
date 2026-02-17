@@ -130,10 +130,11 @@ class StaticSyntaxAnalyzer:
         
         def walk(node, parent_is_error=False):
             is_error = node.type == 'ERROR'
-            is_missing = node.is_missing
+            is_missing = getattr(node, 'is_missing', False) 
             
             if (is_error or is_missing) and not parent_is_error:
                 line = node.start_point[0] + 1
+                col = node.start_point[1] + 1
                 col = node.start_point[1] + 1
                 end_line = node.end_point[0] + 1
                 

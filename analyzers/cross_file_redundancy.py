@@ -1,7 +1,9 @@
 import ast
-from typing import List, Dict, Tuple
+import re
+from typing import List, Dict, Tuple, Any
 from core.symbol_table import Symbol, SymbolType
 import difflib
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeRemainingColumn
 
 class DuplicateFunction:
     def __init__(self, functions: List[Symbol], similarity: float, reason: str):
@@ -13,127 +15,189 @@ class CrossFileRedundancyDetector:
     """
     Detects semantic duplicates: Functions with same LOGIC but different VARIABLES.
     Approach:
-    1. Structural Filter (AST): Compare code skeletons (node types) to find candidates.
-    2. Semantic Verify (LLM): Ask AI if logic is identical despite renaming.
+    1. Structural Filter: Compare control flow skeletons to find candidates.
+       - Python: AST node types
+       - C/C++/Java: Regex-based keyword sequences
+    2. Semantic Verify (LLM): Ask AI if logic is truly identical.
     """
     
     def __init__(self, symbol_table, llm_client=None):
         self.symbol_table = symbol_table
         self.llm_client = llm_client
+        from rich.console import Console
+        self.console = Console()
     
     async def detect_duplicates(self) -> List[DuplicateFunction]:
         duplicates = []
-        functions = [s for s in self.symbol_table.symbols.values() 
-                    if s.type == SymbolType.FUNCTION and s.body_code]
+        # Filter for functions and classes that have bodies
+        candidates = [s for s in self.symbol_table.symbols.values() 
+                     if s.type in (SymbolType.FUNCTION, SymbolType.CLASS) and s.body_code]
         
         # 1. Structural Fingerprinting (The Filter)
-        # Convert all functions to "skeletons" (AST node sequences)
-        fingerprints = {}
-        for func in functions:
-            try:
-                fingerprints[func.qualified_name] = self._get_structural_fingerprint(func.body_code)
-            except:
-                fingerprints[func.qualified_name] = "" # Parse error fallback
+        fingerprints: Dict[str, str] = {}
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TimeRemainingColumn()
+        ) as progress:
+            task1 = progress.add_task("[cyan]Fingerprinting functions...", total=len(candidates))
+            
+            for symbol in candidates:
+                progress.update(task1, advance=1, description=f"[cyan]Fingerprinting {symbol.name} ({symbol.file.name})")
+                fp = self._get_universal_fingerprint(symbol.body_code, symbol.file.suffix.lower())
+                if len(fp) > 5: # Ignore trivial bodies
+                    fingerprints[symbol.qualified_name] = fp
 
-        # 2. Compare Candidates
-        checked_pairs = set()
+        # 2. Optimized Comparison (Bucket by length or hash to avoid O(N^2))
+        # For now, we'll sort by length and only compare neighbors, or plain O(N^2) if N is small.
+        # Let's simple O(N^2) but with a quick hash check.
         
-        for i, func1 in enumerate(functions):
-            for func2 in functions[i+1:]:
-                # Skip same file
-                if func1.file == func2.file:
-                    continue
+        sorted_keys = sorted(fingerprints.keys(), key=lambda k: len(fingerprints[k]))
+        
+        checked: set = set()
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TimeRemainingColumn()
+        ) as progress:
+            task2 = progress.add_task("[cyan]Comparing functions...", total=len(sorted_keys))
+            
+            for i, name1 in enumerate(sorted_keys):
+                progress.update(task2, advance=1, description=f"[cyan]Comparing {name1}")
+                fp1 = fingerprints[name1]
+                sym1 = self.symbol_table.symbols[name1]
                 
-                # Check normalized structure similarity first
-                fp1 = fingerprints.get(func1.qualified_name)
-                fp2 = fingerprints.get(func2.qualified_name)
-                
-                if not fp1 or not fp2:
-                    continue
+                # Check a window of neighbors with similar complexity
+                # (Simplification: check all for now, N is likely < 100 in tests. 
+                # In prod, use LSH or similar.)
+                for name2 in sorted_keys[i+1:]:
+                    if name1 == name2: continue
+                    sym2 = self.symbol_table.symbols[name2]
                     
-                # Structural Similarity (Sequence Match on Node Types)
-                # This ignores variable names completely!
-                struct_sim = difflib.SequenceMatcher(None, fp1, fp2).ratio()
-                
-                if struct_sim > 0.85: # High structural overlap
-                    # Found a candidate! It has the same "shape" of logic.
+                    # Check 1: Must be same Symbol Type (Function vs Function)
+                    if sym1.type != sym2.type:
+                        continue
+    
+                    fp2 = fingerprints[name2]
                     
-                    # 3. AI Verification (The Judge)
-                    # Even if structure matches, ask LLM if logic is TRULY same
-                    # (e.g. maybe constants differ significantly)
+                    # Optimization: Length diff check
+                    if abs(len(fp1) - len(fp2)) / max(len(fp1), len(fp2)) > 0.3:
+                        continue # Too different in size
                     
-                    is_semantic_duplicate = False
-                    reason = f"Structurally identical (AST match: {struct_sim:.2f})"
+                    # Check 2: Structural Similarity
+                    struct_sim = difflib.SequenceMatcher(None, fp1, fp2).ratio()
                     
-                    if self.llm_client:
-                        llm_result = await self.validate_with_llm(func1, func2)
-                        is_semantic_duplicate = llm_result.get("are_duplicates", False)
-                        if is_semantic_duplicate:
-                            reason = f"AI Confirmed: {llm_result.get('shared_logic_summary', 'Same logic')}"
-                    else:
-                        # Fallback to structural only if no LLM
-                        is_semantic_duplicate = True
+                    # print(f"DEBUG SIMILARITY {name1} vs {name2}: {struct_sim:.2f}") # Debug
+                    
+                    if struct_sim > 0.75: # Slightly relaxed for better recall
+                        # Found a candidate! It has the same "shape" of logic.
                         
-                    if is_semantic_duplicate:
-                        duplicates.append(DuplicateFunction(
-                            functions=[func1, func2],
-                            similarity=struct_sim,
-                            reason=reason
-                        ))
-        
+                        # Show user we are checking this pair using progress console to avoid UI break
+                        progress.console.print(f"  [yellow]?[/yellow] Candidate: [cyan]{sym1.name}[/cyan] vs [cyan]{sym2.name}[/cyan] (Sim: {struct_sim:.2f}) -> Asking AI...")
+                        
+                        if self.llm_client:
+                            llm_result = await self.validate_with_llm(sym1, sym2)
+                            
+                            # print(f"DEBUG LLM: {llm_result}") # Debug
+                            
+                            if llm_result.get("are_duplicates", False):
+                                # Immediate feedback to user
+                                progress.console.print(f"[bold green]✓ DUPLICATE CONFIRMED![/bold green]")
+                                progress.console.print(f"  • Reason: {llm_result.get('shared_logic_summary', 'Same logic')}\n")
+
+                                duplicates.append(DuplicateFunction(
+                                    functions=[sym1, sym2],
+                                    similarity=struct_sim,
+                                    reason=f"AI Confirmed: {llm_result.get('shared_logic_summary', 'Same logic')}"
+                                ))
+                            else:
+                                progress.console.print(f"  [dim]x AI rejected (Different logic)[/dim]")
+                        else:
+                            duplicates.append(DuplicateFunction(
+                                functions=[sym1, sym2],
+                                similarity=struct_sim,
+                                reason=f"Structurally identical ({struct_sim:.2f})"
+                            ))
+
         return duplicates
 
-    def _get_structural_fingerprint(self, code: str) -> str:
+    def _get_universal_fingerprint(self, code: str, extension: str) -> str:
         """
-        Walks the AST and returns a string of node types.
-        Example: "FunctionDef If Compare Return"
-        This strips away all variable names ('x', 'y') and values.
+        Returns a simplified structural string of the code.
         """
+        code = code.strip()
+        if not code: return ""
+
+        if extension == '.py':
+            return self._get_python_fingerprint(code)
+        elif extension in ['.c', '.cpp', '.h', '.hpp', '.java']:
+            return self._get_c_java_fingerprint(code)
+        
+        return code # Fallback: raw code
+
+    def _get_python_fingerprint(self, code: str) -> str:
         try:
-            # Normalize indentation just in case
-            import textwrap
-            code = textwrap.dedent(code)
             tree = ast.parse(code)
-            
             node_types = []
             for node in ast.walk(tree):
-                # We collect the TYPE of the node, e.g. "For", "If", "Assign"
-                node_types.append(type(node).__name__)
-            
+                # Include binops to differentiate math
+                if isinstance(node, ast.BinOp):
+                    node_types.append(f"BinOp_{type(node.op).__name__}")
+                else:
+                    node_types.append(type(node).__name__)
             return " ".join(node_types)
         except:
             return ""
 
-    async def validate_with_llm(self, func1: Symbol, func2: Symbol) -> Dict:
+    def _get_c_java_fingerprint(self, code: str) -> str:
+        # Regex to capture control flow keywords, braces, and operators
+        # Keywords: if, else, for, while, do, switch, case, return, break, continue, try, catch, throw
+        # Operators: +, -, *, /, %, <, >, =, !, &, |, ^
+        token_pattern = re.compile(
+            r'\b(if|else|for|while|do|switch|case|return|break|continue|try|catch|throw)\b'
+            r'|[{}]'
+            r'|([+\-*/%<>!=&|^]=?)'
+        )
+        
+        # findall returns tuples if there are multiple groups, we want to flatten
+        raw_tokens = token_pattern.findall(code)
+        tokens = []
+        for t in raw_tokens:
+            if isinstance(t, tuple):
+                tokens.extend([x for x in t if x])
+            else:
+                tokens.append(t)
+        return " ".join(tokens)
+
+    async def validate_with_llm(self, sym1: Symbol, sym2: Symbol) -> Dict[str, Any]:
         """
         The "AI Judge": Confirms if logic is identical.
         """
         if not self.llm_client:
-            return {"are_similar": False}
+            return {"are_duplicates": False}
         
         prompt = f"""You are a Senior Code Reviewer.
-Compare these two functions provided below.
+Compare these two code snippets provided below.
 
 GOAL: Determine if they implement the SAME LOGIC/ALGORITHM.
 Ignore:
-- Variable names (e.g. 'calc_tax' vs 'get_vat')
-- Function names
+- Variable names
+- Function/Class names
 - Comments/Docstrings
 - Whitespace formatting
+- Syntax differences (if different languages)
 
-Focus on:
-- Control flow (loops, ifs)
-- Data transformations
-- The core algorithm
-
-Function 1 ({func1.name}):
-```python
-{func1.body_code}
+Snippet 1 ({sym1.name} in {sym1.file.name}):
+```{sym1.language if hasattr(sym1, 'language') else ''}
+{sym1.body_code}
 ```
 
-Function 2 ({func2.name}):
-```python
-{func2.body_code}
+Snippet 2 ({sym2.name} in {sym2.file.name}):
+```{sym2.language if hasattr(sym2, 'language') else ''}
+{sym2.body_code}
 ```
 
 Are they semantic duplicates?
@@ -141,8 +205,8 @@ Respond ONLY with valid JSON:
 {{
   "are_duplicates": boolean,
   "confidence": float (0.0-1.0),
-  "shared_logic_summary": "Short 1-line description of the common logic",
-  "optimization_suggestion": "How to consolidate them"
+  "shared_logic_summary": "Short 1-line description",
+  "optimization_suggestion": "How to consolidate"
 }}"""
         
         try:
