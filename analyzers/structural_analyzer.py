@@ -87,6 +87,29 @@ class StructuralAnalyzer:
 
             except Exception as e:
                 print(f"Error parsing {file_path}: {e}")
+        
+        # Sync raw_data alias for detection methods
+        self.raw_data = self.file_data_map
+        
+        # 2. Run Structural Checks (using the fully populated symbol table)
+        
+        # Cycle Detection
+        function_cycles = self._detect_function_cycles(self.symbol_table)
+        
+        # Dead Code
+        dead_code = self._detect_dead_code(self.symbol_table)
+        
+        # Unused Variables
+        unused_vars = self._detect_unused_variables(self.symbol_table)
+        
+        return {
+            "symbol_table_object": self.symbol_table,
+            "circular_dependencies": [], # File-level, handled by main.py or separate logic
+            "function_cycles": function_cycles,
+            "dead_code": dead_code,
+            "unused_variables": unused_vars,
+            "raw_data": self.file_data_map
+        }
 
     def _build_import_graph(self) -> Dict[str, Set[str]]:
         """Map file paths to the modules/files they import."""
@@ -171,7 +194,7 @@ class StructuralAnalyzer:
             
         return cycles
 
-    def _detect_function_cycles(self, symbol_builder: SymbolTableBuilder) -> List[List[Symbol]]:
+    def _detect_function_cycles(self, symbol_builder: SymbolTableBuilder) -> List[List[STSymbol]]:
         """
         Find circular function dependencies (recursion/mutual recursion).
         Uses dependency-based call resolution instead of name-based matching.
@@ -187,7 +210,7 @@ class StructuralAnalyzer:
         
         # Populate class_methods from symbols
         for qname, sym in symbol_builder.symbols.items():
-            if sym.type == SymbolType.FUNCTION and sym.parent_name:
+            if sym.type == STSymbolType.FUNCTION and sym.parent_name:
                 if sym.parent_name not in class_methods:
                     class_methods[sym.parent_name] = {}
                 class_methods[sym.parent_name][sym.name] = sym
@@ -195,7 +218,7 @@ class StructuralAnalyzer:
         # Build standalone functions map: (file, name) -> Symbol
         standalone_map = {}
         for qname, sym in symbol_builder.symbols.items():
-            if sym.type == SymbolType.FUNCTION and not sym.parent_name:
+            if sym.type == STSymbolType.FUNCTION and not sym.parent_name:
                 key = (str(sym.file), sym.name)
                 standalone_map[key] = sym
         
@@ -243,7 +266,7 @@ class StructuralAnalyzer:
         # Build graph: Symbol -> [Symbol]
         graph = {}
         for qname, sym in symbol_builder.symbols.items():
-            if sym.type != SymbolType.FUNCTION:
+            if sym.type != STSymbolType.FUNCTION:
                 continue
             
             graph[sym] = []
@@ -271,7 +294,7 @@ class StructuralAnalyzer:
         visited = set()
         recursion_stack = []
         
-        def dfs(current: Symbol):
+        def dfs(current: STSymbol):
             visited.add(current)
             recursion_stack.append(current)
             
@@ -319,7 +342,7 @@ class StructuralAnalyzer:
         dead = []
         for qname, symbol in symbol_builder.symbols.items():
             # Only check functions and methods
-            if symbol.type != SymbolType.FUNCTION:
+            if symbol.type != STSymbolType.FUNCTION:
                 continue
             
             # Skip ALL dunder methods (__init__, __del__, __str__, __repr__, etc.)

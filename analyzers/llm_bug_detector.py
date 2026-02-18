@@ -9,13 +9,12 @@ import json
 from utils.llm_utils import extract_json, robust_json_load
 
 class SemanticBug:
-    def __init__(self, bug_type: str, severity: str, line: int, description: str, suggestion: str, code_patch: str = ""):
+    def __init__(self, bug_type: str, severity: str, line: int, description: str, suggestion: str):
         self.type = bug_type
         self.severity = severity
         self.line = line
         self.description = description
         self.suggestion = suggestion
-        self.code_patch = code_patch
 
 class LLMBugDetector:
     """
@@ -36,9 +35,10 @@ class LLMBugDetector:
         global_vars: str = "",
         imports_list: str = "",
         verbose: bool = False
-    ) -> List[SemanticBug]:
+    ) -> tuple[List[SemanticBug], str]:
         """
         Analyze a specific symbol (function/method) with focused context.
+        Returns: (List[SemanticBug], corrected_code)
         """
         prompt = self._build_focused_prompt(
             symbol_name, code, language, file_path.name, 
@@ -55,7 +55,7 @@ class LLMBugDetector:
             result = robust_json_load(response)
             
             if not result or not result.get("issues"):
-                return []
+                return [], ""
             
             bugs = []
             for issue in result.get("issues", []):
@@ -64,13 +64,14 @@ class LLMBugDetector:
                     severity=issue.get("severity", "medium"),
                     line=issue.get("line", 0),
                     description=issue.get("description", ""),
-                    suggestion=issue.get("suggestion", ""),
-                    code_patch=issue.get("code_patch", "")
+                    suggestion=issue.get("suggestion", "")
                 ))
-            return bugs
+            
+            corrected_code = result.get("corrected_code", "")
+            return bugs, corrected_code
         except Exception as e:
             print(f"Focused analysis failed for {symbol_name}: {e}")
-            return []
+            return [], ""
 
     def _build_focused_prompt(
         self, name: str, code: str, lang: str, file: str, 
@@ -116,10 +117,12 @@ Your goal is to find real, logical bugs and provide a concrete code patch for ea
 5. RACE CONDITIONS or concurrency issues (even if theoretical).
 
 **Strict Rules:**
-1. For every bug found, you MUST provide a "code_patch" that fixes the issue.
-2. The code_patch MUST be a complete replacement for the buggy portion of the code.
-3. DO NOT report style, naming, or minor best practice violations.
-4. Respond ONLY with the JSON object.
+1. List ALL detected issues in the "issues" array.
+2. Provide a SINGLE "corrected_code" block that fixes ALL listed issues simultaneously.
+3. The "corrected_code" MUST be the COMPLETE replacement for the target symbol (function/class).
+4. DO NOT provide "code_patch" inside individual issue objects.
+5. DO NOT report style, naming, or minor best practice violations.
+6. Respond ONLY with the JSON object.
 
 Respond with a JSON object:
 {{
@@ -129,15 +132,16 @@ Respond with a JSON object:
       "severity": "critical|high|medium|low",
       "line": <line_number>,
       "description": "<extremely detailed plain-text description of why it is a bug, be pedantic>",
-      "suggestion": "<plain-text description of how to resolve>",
-      "code_patch": "<complete fixed code snippet for this specific issue>"
+      "suggestion": "<plain-text description of how to resolve>"
     }}
-  ]
+  ],
+  "corrected_code": "<complete fixed code for the entire symbol, resolving ALL issues>"
 }}"""
 
-    async def analyze_code(self, file_path: Path, code: str, language: str, verbose: bool = False) -> List[SemanticBug]:
+    async def analyze_code(self, file_path: Path, code: str, language: str, verbose: bool = False) -> tuple[List[SemanticBug], str]:
         """
-        Analyze whole file for semantic bugs using vLLM.
+        Analyze the entire file content.
+        Returns: (List[SemanticBug], corrected_code)
         """
         prompt = self._build_detection_prompt(file_path, code, language)
         
@@ -154,19 +158,24 @@ Respond with a JSON object:
                 return []
             
             bugs = []
+            if not result or not result.get("issues"):
+                return [], ""
+            
+            bugs = []
             for issue in result.get("issues", []):
                 bugs.append(SemanticBug(
                     bug_type=issue.get("type", "bug"),
                     severity=issue.get("severity", "medium"),
                     line=issue.get("line", 0),
                     description=issue.get("description", ""),
-                    suggestion=issue.get("suggestion", ""),
-                    code_patch=issue.get("code_patch", "")
+                    suggestion=issue.get("suggestion", "")
                 ))
-            return bugs
+            
+            corrected_code = result.get("corrected_code", "")
+            return bugs, corrected_code
         except Exception as e:
-            print(f"LLM analysis failed for {file_path}: {e}")
-            return []
+            print(f"Whole-file analysis failed for {file_path}: {e}")
+            return [], ""
     
     def _build_detection_prompt(self, file_path: Path, code: str, language: str) -> str:
         return f"""You are a senior {language} code auditor. 

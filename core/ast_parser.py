@@ -119,11 +119,30 @@ class StructuralParser:
                 self.imports = []
                 self.calls_in_current = []
                 self.calls_detailed_in_current = []
+                self.variables = []
+                self.identifiers = []
 
             def visit_Import(self, node):
                 names = [alias.name for alias in node.names]
                 self.imports.append({"module": None, "names": names})
                 self.generic_visit(node)
+
+            def visit_Assign(self, node):
+                # Capture global variables (not within function/class)
+                if not self.current_function and not self.current_class:
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            self.variables.append({
+                                "name": target.id,
+                                "line": node.lineno
+                            })
+                self.generic_visit(node)
+
+            def visit_Name(self, node):
+                if isinstance(node.ctx, ast.Load):
+                    self.identifiers.append(node.id)
+                self.generic_visit(node)
+
 
             def visit_ImportFrom(self, node):
                 names = [alias.name for alias in node.names]
@@ -142,12 +161,18 @@ class StructuralParser:
                     elif isinstance(base, ast.Attribute):
                         bases.append(base.attr)
                 
+                try:
+                    body_code = ast.get_source_segment(self.source_code, node)
+                except:
+                    body_code = ""
+
                 class_data = {
                     "name": node.name,
                     "line": node.lineno,
                     "methods": [],
                     "attributes": [],
-                    "bases": bases
+                    "bases": bases,
+                    "body_code": body_code
                 }
                 
                 for item in node.body:
@@ -302,7 +327,8 @@ class StructuralParser:
                     "name": current_class,
                     "line": node.start_point[0] + 1,
                     "methods": [],
-                    "attributes": []
+                    "attributes": [],
+                    "body_code": code[node.start_byte:node.end_byte]
                 })
             
             elif tag == 'func':
