@@ -33,7 +33,7 @@ class CrossFileRedundancyDetector:
     }
 
     MIN_BODY_LINES = 3           # minimum function body lines to consider
-    AST_SIMILARITY_THRESHOLD = 0.55  # structural similarity cutoff for LLM pass
+    AST_SIMILARITY_THRESHOLD = 0.30  # structural similarity cutoff for LLM pass
     AUTO_CONFIRM_THRESHOLD = 0.95    # above this → auto-confirm without LLM (near-exact structure only)
 
     def __init__(self, symbol_table, llm_client=None):
@@ -316,53 +316,49 @@ RULES:
 - Two functions where one computes `a * b` (multiplication) and the other returns `a + b` (addition) are NOT duplicates.
 - A function doing math (like `return w * h`) and a function building a string (like `return f"SELECT..."`) are NOT duplicates — completely different domains.
 - If both check inputs then do the same math, but one uses `if a < 0 or b < 0` and the other uses two separate `if` statements, they ARE still duplicates.
+- A function using iteration (a loop) and a function using recursion (calling itself) to compute the same result ARE duplicates.
 
-After your analysis, output your verdict as JSON:
+        After your analysis, output your verdict as a JSON object. 
+        IMPORTANT: Do NOT include any text before or after the JSON block. Output ONLY the JSON.
 
 ```json
 {{
   "are_duplicates": true or false,
-  "shared_logic_summary": "Short explanation of WHY they are duplicates or WHY they differ",
-  "optimization_suggestion": "how to consolidate (or N/A)"
+  "shared_logic_summary": "Short explanation",
+  "optimization_suggestion": "Consolidation advice"
 }}
 ```"""
 
         try:
             response = await self.llm_client.generate_completion(prompt)
             return self._parse_llm_json(response)
-        except Exception as e:
-            # On any failure, conservatively say "not duplicates"
+        except Exception:
             return {"are_duplicates": False}
 
     def _parse_llm_json(self, response: str) -> Dict:
-        """Extract JSON from LLM response, trying multiple strategies."""
-        # Strategy 1: fenced json block
-        m = re.search(r'```json\s*(\{.*?\})\s*```', response, re.DOTALL)
-        if m:
-            return self._safe_json_load(m.group(1))
+        """Extract JSON from LLM response with improved robustness."""
+        # 1. Look for JSON blocks
+        json_blocks = re.findall(r'```json\s*(\{.*?\})\s*```', response, re.DOTALL)
+        if not json_blocks:
+            json_blocks = re.findall(r'```\s*(\{.*?\})\s*```', response, re.DOTALL)
+        
+        if json_blocks:
+            for block in reversed(json_blocks):
+                data = self._safe_json_load(block)
+                if data and "are_duplicates" in data:
+                    return data
 
-        # Strategy 2: fenced block without language tag
-        m = re.search(r'```\s*(\{.*?\})\s*```', response, re.DOTALL)
-        if m:
-            return self._safe_json_load(m.group(1))
+        # 2. Look for explicit JSON strings
+        matches = re.findall(r'(\{.*?"are_duplicates".*?\})', response, re.DOTALL)
+        for m in reversed(matches):
+            data = self._safe_json_load(m)
+            if data and "are_duplicates" in data:
+                return data
 
-        # Strategy 3: bare JSON object anywhere in text
-        m = re.search(r'(\{[^{}]*"are_duplicates"[^{}]*\})', response, re.DOTALL)
-        if m:
-            return self._safe_json_load(m.group(1))
-
-        # Strategy 4: keyword extraction fallback
-        dup_match = re.search(r'"are_duplicates"\s*:\s*(true|false)', response, re.IGNORECASE)
-        if dup_match:
-            is_dup = dup_match.group(1).lower() == 'true'
-            summary_match = re.search(r'"shared_logic_summary"\s*:\s*"([^"]*)"', response)
-            suggestion_match = re.search(r'"optimization_suggestion"\s*:\s*"([^"]*)"', response)
-            return {
-                "are_duplicates": is_dup,
-                "shared_logic_summary": summary_match.group(1) if summary_match else "Similar logic",
-                "optimization_suggestion": suggestion_match.group(1) if suggestion_match else "Consolidate",
-            }
-
+        # 3. Heuristic
+        if '"are_duplicates": true' in response.lower():
+            return {"are_duplicates": True, "shared_logic_summary": "Heuristic match", "optimization_suggestion": "N/A"}
+        
         return {"are_duplicates": False}
 
     @staticmethod

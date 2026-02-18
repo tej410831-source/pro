@@ -154,10 +154,7 @@ Respond with a JSON object:
             response = await self.llm_client.generate_completion(prompt, temperature=0.1)
             # Parse JSON response
             result = robust_json_load(response)
-            if not result:
-                return []
             
-            bugs = []
             if not result or not result.get("issues"):
                 return [], ""
             
@@ -189,8 +186,9 @@ BE EXTREMELY PEDANTIC. Report anything that breaks logic or creates risks.
 4. Concurrency or race conditions.
 
 **Rules:**
-1. Provide a "code_patch" field for every issue.
-2. No style/formatting issues.
+1. Provide a "corrected_code" field that contains the COMPLETE file content with all fixes applied.
+2. List ALL detected issues in the "issues" array.
+3. No style/formatting issues.
 
 File: {file_path.name}
 ```{language}
@@ -205,8 +203,8 @@ Respond with a JSON object:
       "severity": "critical|high|medium|low",
       "line": <line_number>,
       "description": "<plain-text description>",
-      "suggestion": "<plain-text resolution steps>",
-      "code_patch": "<complete fixed code snippet>"
+      "suggestion": "<plain-text resolution steps>"
     }}
-  ]
+  ],
+  "corrected_code": "<complete fixed code for the entire file>"
 }}"""

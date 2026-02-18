@@ -245,28 +245,39 @@ class SyntaxFixGenerator:
         }
         
         # Build MINIMAL, focused prompt — ask for JUST the fixed line
-        broken_line = window_lines[error_in_window].rstrip()
+        # INCLUDE PREVIOUS LINE to catch missing semicolons/operators
+        broken_line_idx = error_in_window
+        prev_line_idx = max(0, broken_line_idx - 1)
+        
+        focus_lines = window_lines[prev_line_idx:broken_line_idx + 1]
+        focus_code = '\n'.join([l.rstrip() for l in focus_lines])
         
         prompt = f"""Fix this {language} syntax error.
 
 Error: {error.message}
 
-This is the broken line:
-{broken_line}
+This is the code section with the error (check preceding lines too):
+{focus_code}
 
 Here is the surrounding code for context:
 {code_window}
 
-Reply with ONLY the corrected line and a short explanation, like this:
+Reply with the corrected line(s) in a Markdown code block, followed by a short explanation.
+IMPORTANT: 
+1. Do NOT change the logic of the code. Maintain the original logic exactly. Only fix the syntax error.
+2. Output ONLY the fixed lines. Do NOT include the surrounding code or the original broken lines.
+3. Do NOT repeat the context.
+4. Ensure the generated code is valid {language} syntax and does not introduce new errors.
+5. If the error is 'unexpected EOF', 'missing }}', or related to unbalanced blocks, ensure you provide ALL necessary closing braces/tokens to close the block(s) properly.
+6. Check strings for unescaped quotes and lines PRECEDING the error for missing semicolons/operators.
 
-<FIX>
-<CODE>
+Example:
+```python
 class Foo:
-</CODE>
-<EXPLANATION>Added missing colon</EXPLANATION>
-</FIX>
+```
+Explanation: Added missing colon.
 
-Now fix the broken line. Output ONLY the single corrected line:
+Now fix the broken line.
 """
         
         if verbose:
@@ -275,35 +286,79 @@ Now fix the broken line. Output ONLY the single corrected line:
         try:
             response = await self.llm_client.generate_completion(prompt, temperature=0.1)
             
-            fixed_code, explanation = self._parse_fix_response(response)
+            fixed_code, explanation = self._parse_fix_response(response, original_code=code_window)
             
+            # Validate: reject placeholder/template text echoed by LLM
             # Validate: reject placeholder/template text echoed by LLM
             if not fixed_code or self._is_placeholder_text(fixed_code, 1):
                 # Retry once with higher temperature
                 response = await self.llm_client.generate_completion(prompt, temperature=0.5)
-                fixed_code, explanation = self._parse_fix_response(response)
+                fixed_code, explanation = self._parse_fix_response(response, original_code=code_window)
                 
                 if not fixed_code or self._is_placeholder_text(fixed_code, 1):
                     raise ValueError("LLM returned placeholder text instead of actual code")
             
-            # The LLM returns the corrected line(s) — reconstruct the full window
+            # --- START SMARTER REPLACEMENT LOGIC ---
             fixed_lines = fixed_code.strip().splitlines()
+            # Match indentation of the focus line
+            error_line_original = window_lines[error_in_window]
+            error_indent_len = len(error_line_original) - len(error_line_original.lstrip())
+            error_indent = error_line_original[:error_indent_len]
             
-            # Replace the broken line(s) in the window with the fix
+            # Apply error line's base indent to all LLM lines
+            # This ensures that even if LLM returns 0-indent code, it's correctly placed
+            fixed_lines = [(error_indent + line.lstrip()) for line in fixed_lines]
+            
+            # Reconstruct the window while checking for overlaps
             reconstructed = list(window_lines)
-            if len(fixed_lines) == 1:
-                # Single line fix — replace just the error line
-                reconstructed[error_in_window] = fixed_lines[0]
+            
+            # If the LLM returned multiple lines, it might have included lines that exist below
+            replace_count = 1
+            if len(fixed_lines) > 1:
+                for i in range(1, len(fixed_lines)):
+                    window_idx = error_in_window + i
+                    if window_idx < len(window_lines):
+                        if fixed_lines[i].strip() == window_lines[window_idx].strip():
+                            replace_count = i + 1
+            
+            # Replace the appropriate range
+            reconstructed[error_in_window:error_in_window + replace_count] = fixed_lines
+            
+            # --- START MINIMAL PATCH CALCULATION ---
+            # Instead of returning the whole window, find the actual changed range
+            import difflib
+            matcher = difflib.SequenceMatcher(None, window_lines, reconstructed)
+            
+            # Find the cluster of changes
+            has_changes = False
+            first_op = None
+            last_op = None
+            
+            for op in matcher.get_opcodes():
+                if op[0] != 'equal':
+                    if first_op is None: first_op = op
+                    last_op = op
+                    has_changes = True
+            
+            if has_changes:
+                # Range in Original (window_lines)
+                start_change_orig = first_op[1]
+                end_change_orig = last_op[2] # Exclusive
+                # Range in New (reconstructed)
+                start_change_new = first_op[3]
+                end_change_new = last_op[4] # Exclusive
+                
+                # Update region to reflect only the changed block
+                region['start_line'] = start_line + start_change_orig + 1
+                region['end_line'] = start_line + end_change_orig
+                
+                # Grab the fixed code segment
+                final_fixed_lines = reconstructed[start_change_new:end_change_new]
+                fixed_code = '\n'.join(final_fixed_lines)
             else:
-                # Multi-line fix — replace around the error line
-                reconstructed[error_in_window:error_in_window + 1] = fixed_lines
-            
-            fixed_code = '\n'.join(reconstructed)
-            
-            # Apply context-aware indentation
-            expected_indent = self._get_expected_base_indent(code, region)
-            fixed_code = self._force_base_indent(fixed_code, expected_indent)
-            
+                # Fallback
+                fixed_code = '\n'.join(reconstructed)
+
             return {
                 'success': True,
                 'fixed_code': fixed_code,
@@ -318,17 +373,68 @@ Now fix the broken line. Output ONLY the single corrected line:
                 'region': region
             }
     
-    def _parse_fix_response(self, response: str):
+    def _parse_fix_response(self, response: str, original_code: str = None):
         """Parse LLM response into fixed_code and explanation."""
-        response_data = extract_xml_fixes(response)
-        if not response_data:
-            response_data = extract_code_from_markdown(response, num_regions=1)
+        import difflib
+
+        # 1. Try Markdown first (preferred)
+        response_data = extract_code_from_markdown(response)
         
-        if not response_data or not response_data.get('fixes'):
-            return None, 'Fixed syntax error.'
+        fixed_code = None
+        explanation = "Fixed syntax error."
         
-        fix = response_data['fixes'][0]
-        return fix.get('fixed_code', ''), fix.get('explanation', 'Fixed syntax error.')
+        if response_data and response_data.get('fixes'):
+            # Filter out blocks that are just the original code (context echo)
+            candidates = response_data['fixes']
+            best_candidate = None
+            
+            for candidate in candidates:
+                code_chunk = candidate.get('fixed_code', '').strip()
+                if not code_chunk: continue
+                
+                # If we have original code, check similarity
+                if original_code:
+                    # Normalized comparison
+                    matcher = difflib.SequenceMatcher(None, code_chunk, original_code.strip())
+                    if matcher.ratio() > 0.90:
+                        # This is likely just the context repeated
+                        continue
+                
+                best_candidate = candidate
+                # If we found a non-matching block, assume it's the fix and stop? 
+                # Or keep looking? Usually context comes first, fix second.
+                # If valid candidate found, break? 
+                # Let's take the first non-echo block.
+                break
+            
+            if best_candidate:
+                fixed_code = best_candidate.get('fixed_code', '')
+                explanation = best_candidate.get('explanation', 'Fixed syntax error.')
+        
+        # 2. Try XML as fallback if no valid markdown code found
+        if not fixed_code:
+            response_data = extract_xml_fixes(response)
+            if response_data and response_data.get('fixes'):
+                 fixed_code = response_data['fixes'][0].get('fixed_code', '')
+                 explanation = response_data['fixes'][0].get('explanation', 'Fixed syntax error.')
+
+        # 3. Fallback: If response looks like raw code (no markdown/xml tags), use it directly
+        if not fixed_code:
+            # Simple heuristic: if it looks like code and not conversational text
+            cleaned = response.strip()
+            # If it's a raw echo, we might still fail here, but usually raw echo lacks tags
+            if not cleaned.startswith('<') and not cleaned.startswith('Here is'):
+                 # Check similarity again if possible
+                 if original_code:
+                     matcher = difflib.SequenceMatcher(None, cleaned, original_code.strip())
+                     if matcher.ratio() < 0.90:
+                        fixed_code = cleaned
+                        explanation = 'Fixed syntax error (raw response).'
+                 else:
+                    fixed_code = cleaned
+                    explanation = 'Fixed syntax error (raw response).'
+        
+        return fixed_code, explanation
     
     def _is_placeholder_text(self, code: str, expected_lines: int) -> bool:
         """
@@ -644,7 +750,10 @@ Errors:
 Code:
 {code}
 
-Return JSON with "fixed_code" and "explanation" keys."""
+Return JSON with "fixed_code" and "explanation" keys.
+Ensure the generated code is valid {language} syntax and does not introduce new errors.
+If the code is missing closing braces/tokens, ensure the fixed code is complete and valid.
+Check lines PRECEDING the error for missing semicolons or operators."""
         
         
         try:
@@ -876,6 +985,7 @@ Code (lines {region['start_line']}-{region['end_line']}):
 {regions_str}
 
 CRITICAL: You MUST return ONLY XML tags. Do NOT use markdown code blocks (```). Do NOT add explanatory text outside the XML structure.
+Ensure the generated code is valid {language} syntax and does not introduce new errors.
 
 Return output using EXACTLY this XML format:
 
@@ -892,6 +1002,8 @@ RULES:
 2. Inside <CODE>, put the raw fixed code directly. Do NOT wrap it in backticks.
 3. Preserve original block indentation unless it causes syntax errors (top-level code = 0 indent).
 4. For multiple regions, return multiple <FIX> blocks.
+5. If an error indicates a missing closing brace/token, ensure the FIXED code includes it.
+6. Check lines PRECEDING the error for missing semicolons or operators.
 
 Example (for C++):
 <FIX>
@@ -931,9 +1043,15 @@ void log_message(std::string msg) {{
     def _get_language(self, file_path: Path) -> str:
         """Determine language from file extension."""
         ext_map = {
-            '.py': 'python'
+            '.py': 'python',
+            '.c': 'c',
+            '.cpp': 'cpp',
+            '.cc': 'cpp',
+            '.h': 'cpp',
+            '.hpp': 'cpp',
+            '.java': 'java'
         }
-        return ext_map.get(file_path.suffix, 'python')
+        return ext_map.get(file_path.suffix.lower(), 'python')
     
     def _extract_code(self, response: str, language: str) -> str:
         """Extract code from LLM response."""

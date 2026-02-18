@@ -52,7 +52,7 @@ python main.py analyze /path/to/your/project --output report.json --generate-fix
 ### Custom vLLM URL
 
 ```bash
-python main.py analyze /path/to/your/project --vllm-url http://localhost:11434/v1
+python main.py analyze /path --vllm-url http://localhost:8080/v1
 ```
 
 ---

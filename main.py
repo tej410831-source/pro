@@ -26,7 +26,7 @@ console = Console()
 def analyze(
     folder: Path = typer.Argument(..., help="Folder to analyze"),
     output: Path = typer.Option("report.json", "--output", "-o", help="Output report path"),
-    vllm_url: str = typer.Option("http://127.0.0.1:1234/v1", "--vllm-url", help="LLM server URL (OpenAI-compatible)"),
+    vllm_url: str = typer.Option("http://127.0.0.1:8000/v1", "--vllm-url", help="LLM server URL (OpenAI-compatible)"),
     generate_fixes: bool = typer.Option(True, "--fixes/--no-fixes", "--generate-fixes", help="Generate code fixes"),
 
 ):
@@ -390,7 +390,7 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
 
             # 1. Globals Analysis
             if global_vars_str:
-                global_bugs, _ = await bug_detector.analyze_symbol(
+                global_bugs, global_fix = await bug_detector.analyze_symbol(
                     "Global Variables", global_vars_str, language, file_path,
                     class_context="", dependency_hints="", 
                     global_vars="", imports_list=imports_str
@@ -405,10 +405,9 @@ async def run_analysis(folder: Path, output: Path, vllm_url: str, generate_fixes
                          console.print(f"[green]   Suggestion:[/green] {bug.suggestion}")
                      
                      # Show ONE integrated AI code patch for globals
-                     # Note: analyze_symbol for "Global Variables" returns corrected code for just that block
-                     if _ and _.strip():
+                     if global_fix and global_fix.strip():
                         console.print(Panel(
-                            Syntax(_, language, theme="monokai", line_numbers=True),
+                            Syntax(global_fix, language, theme="monokai", line_numbers=True),
                             title=f"[bold blue]UNIFIED FIX for Global Variables[/bold blue]", 
                             border_style="blue"
                         ))

@@ -48,8 +48,12 @@ class StaticSyntaxAnalyzer:
                 try:
                     parser = tree_sitter_languages.get_parser(lang_id)
                     self.ts_parsers[lang_id] = parser
-                except Exception:
-                    pass  # Language grammar not available
+                except Exception as e:
+                    print(f"[WARNING] Failed to load tree-sitter parser for {lang_id}: {e}")
+                    # Likely incompatibility between tree-sitter and tree-sitter-languages
+                    pass
+        else:
+            print("[DEBUG] Tree-sitter NOT available (ImportError)")
     
     def analyze_file(self, file_path: Path) -> Tuple[bool, List[FileSyntaxError]]:
         """
